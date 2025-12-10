@@ -309,6 +309,17 @@ class _PureMakerMixin:
                 return fallback
         return fallback
 
+    def _reset_round_progress(self) -> None:
+        """在強制結束當前一輪時重置掛單目標與狀態。"""
+        self._current_buy_order_qty = 0.0
+        self._current_sell_order_qty = 0.0
+        self._buy_filled_qty = 0.0
+        self._sell_filled_qty = 0.0
+        self._bid_filled = False
+        self._ask_filled = False
+        self.active_buy_orders = []
+        self.active_sell_orders = []
+
     def _is_post_only_immediate_match_error(self, error_message: Optional[str]) -> bool:
         if not error_message:
             return False
@@ -616,6 +627,7 @@ class _PureMakerMixin:
                 self.cancel_existing_orders()
             except Exception as exc:
                 logger.error("取消剩余掛單失敗: %s", exc)
+            self._reset_round_progress()
             self._schedule_next_round()
             return
 
