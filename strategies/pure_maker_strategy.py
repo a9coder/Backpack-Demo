@@ -648,7 +648,7 @@ class _PureMakerMixin:
         if abs(prev_net) < min_qty and current_size >= min_qty:
             logger.info("檢測到首筆建倉完成，準備掛出第一檔加倉單")
             self._scale_in_last_ref_price = avg_entry
-            self._place_next_scale_in_order(
+            self._place_scale_in_ladder(
                 direction=direction,
                 base_price=avg_entry,
                 current_size=current_size,
@@ -690,7 +690,7 @@ class _PureMakerMixin:
                 )
 
             self._scale_in_last_ref_price = avg_entry
-            self._place_next_scale_in_order(
+            self._place_scale_in_ladder(
                 direction=direction,
                 base_price=avg_entry,
                 current_size=current_size,
@@ -698,7 +698,7 @@ class _PureMakerMixin:
                 step_ratio=step_ratio,
             )
 
-    def _place_next_scale_in_order(
+    def _place_scale_in_ladder(
         self,
         direction: str,
         base_price: float,
@@ -706,47 +706,83 @@ class _PureMakerMixin:
         max_position: float,
         step_ratio: float,
     ) -> None:
-        """根據當前持倉與配置掛出下一檔加倉單。"""
+        """根據當前持倉與配置一次性掛出剩餘所有加倉單。"""
         min_qty = getattr(self, "min_order_size", 0.0)
-
-        if max_position <= 0.0 or current_size >= max_position:
-            logger.info("當前持倉已達到或超過最大倉位限制，不再掛出新的加倉單")
+        if max_position <= 0.0 or current_size >= max_position - min_qty / 2:
+            logger.info("持倉已接近或達到最大上限，無需額外加倉單")
             return
 
-        target_size = min(
-            max_position,
-            current_size * (1.0 + self.scale_in_size_pct / 100.0),
-        )
-        add_qty = max(0.0, target_size - current_size)
-        add_qty = round_to_precision(add_qty, self.base_precision)
+        if self.scale_in_size_pct <= 0.0 or step_ratio <= 0.0:
+            logger.info("未設定有效的加倉步長/比例，跳過加倉梯度")
+            return
 
-        if add_qty < min_qty:
-            logger.info(
-                "下一檔加倉數量 %s 低於最小下單單位 %s，跳過加倉單",
-                format_balance(add_qty),
-                format_balance(min_qty),
+        # 初始化
+        remaining_size = current_size
+        level = 0
+        current_price = base_price
+        orders_placed = 0
+
+        while remaining_size + min_qty <= max_position:
+            target_size = min(
+                max_position,
+                remaining_size * (1.0 + self.scale_in_size_pct / 100.0),
             )
-            return
+            add_qty = max(0.0, target_size - remaining_size)
+            add_qty = round_to_precision(add_qty, self.base_precision)
 
-        if direction == "LONG":
-            price = round_to_tick_size(base_price * (1.0 - step_ratio), self.tick_size)
-            side = "Bid"
-        else:
-            price = round_to_tick_size(base_price * (1.0 + step_ratio), self.tick_size)
-            side = "Ask"
+            if add_qty < min_qty:
+                logger.info(
+                    "加倉梯度剩餘數量 %s 低於最小下單單位 %s，停止掛單",
+                    format_balance(add_qty),
+                    format_balance(min_qty),
+                )
+                break
 
-        logger.info(
-            "掛出下一檔加倉單: 方向=%s, 價格=%.8f, 數量=%s",
-            side,
-            price,
-            format_balance(add_qty),
-        )
-        self._place_post_only_perp_order(
-            side=side,
-            quantity=add_qty,
-            price=price,
-            reduce_only=False,
-        )
+            level += 1
+            if direction == "LONG":
+                price_factor = 1.0 - step_ratio
+                if price_factor <= 0:
+                    logger.warning("加倉價格係數<=0，停止掛單")
+                    break
+                current_price *= price_factor
+                side = "Bid"
+            else:
+                price_factor = 1.0 + step_ratio
+                current_price *= price_factor
+                side = "Ask"
+
+            price = round_to_tick_size(current_price, self.tick_size)
+            if price <= 0:
+                logger.warning("加倉價計算結果<=0（方向=%s），停止掛單", direction)
+                break
+
+            logger.info(
+                "掛出加倉梯度 #%d: 方向=%s, 價格=%.8f, 數量=%s",
+                level,
+                side,
+                price,
+                format_balance(add_qty),
+            )
+
+            result = self._place_post_only_perp_order(
+                side=side,
+                quantity=add_qty,
+                price=price,
+                reduce_only=False,
+            )
+            if isinstance(result, dict) and "error" in result:
+                logger.error("加倉梯度 #%d 下單失敗: %s", level, result.get("error"))
+                break
+
+            orders_placed += 1
+            remaining_size = target_size
+
+            # 若已達到最大倉位上限則停止
+            if remaining_size >= max_position - min_qty / 2:
+                break
+
+        if orders_placed == 0:
+            logger.info("未能掛出任何加倉梯度（方向=%s）", direction)
 
     def run(self, duration_seconds: int = 3600, interval_seconds: int = 60):  # type: ignore[override]
         """純 Maker-Maker 策略運行入口（事件驅動，不使用 interval 輪詢）。
