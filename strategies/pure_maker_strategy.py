@@ -411,7 +411,6 @@ class _PureMakerMixin:
             quantity=expected_size,
             price=new_avg_price,
             order_type="Limit",
-            reduce_only=True,
             post_only=True,
         )
         if isinstance(close_result, dict) and "error" in close_result:
