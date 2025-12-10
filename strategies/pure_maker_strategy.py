@@ -51,6 +51,8 @@ class _PureMakerMixin:
         self._next_round_thread: Optional[threading.Thread] = None
         self._restart_on_flat = False
         self._max_post_only_adjustments = 50
+        self._current_close_order_id: Optional[str] = None
+        self._scale_ladder_deployed = False
         
         # 成交追踪
         self._bid_filled = False
@@ -324,6 +326,8 @@ class _PureMakerMixin:
         self._ask_filled = False
         self.active_buy_orders = []
         self.active_sell_orders = []
+        self._scale_ladder_deployed = False
+        self._current_close_order_id = None
 
     def _start_cycle_async(self, delay: float = 0.0) -> None:
         if getattr(self, "_stop_flag", False):
@@ -371,6 +375,21 @@ class _PureMakerMixin:
             format_balance(qty),
         )
         return True
+
+    def _cancel_close_order(self) -> None:
+        order_id = self._current_close_order_id
+        if not order_id:
+            return
+        try:
+            result = self.client.cancel_order(order_id, self.symbol)
+            if isinstance(result, dict) and "error" in result:
+                logger.warning("取消平倉單 %s 失敗: %s", order_id, result.get("error"))
+            else:
+                logger.info("已取消舊的平倉單 %s", order_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("取消平倉單 %s 出錯: %s", order_id, exc)
+        finally:
+            self._current_close_order_id = None
 
     def _handle_order_submission_failure(self, side: str, error: Any) -> None:
         logger.warning("方向 %s 掛單失敗，啟動恢復流程: %s", side, error)
@@ -452,6 +471,9 @@ class _PureMakerMixin:
             )
 
             if not (isinstance(last_result, dict) and "error" in last_result):
+                if reduce_only:
+                    order_id = last_result.get("id")
+                    self._current_close_order_id = str(order_id) if order_id else None
                 return last_result
 
             error_text = str(last_result.get("error"))
@@ -735,16 +757,19 @@ class _PureMakerMixin:
         if abs(prev_net) < min_qty and current_size >= min_qty:
             logger.info("檢測到首筆建倉完成，準備掛出第一檔加倉單")
             self._scale_in_last_ref_price = avg_entry
-            self._place_scale_in_ladder(
-                direction=direction,
-                base_price=avg_entry,
-                current_size=current_size,
-                max_position=max_position,
-                step_ratio=step_ratio,
-            )
+            if not self._scale_ladder_deployed:
+                deployed = self._place_scale_in_ladder(
+                    direction=direction,
+                    base_price=avg_entry,
+                    current_size=current_size,
+                    max_position=max_position,
+                    step_ratio=step_ratio,
+                )
+                if deployed:
+                    self._scale_ladder_deployed = True
             return
 
-        # 情況 3: 同方向持倉增加，視為加倉成交 -> 取消舊對沖單，按新成本價重掛對沖 + 下一檔加倉單
+        # 情況 3: 同方向持倉增加，視為加倉成交 -> 取消舊對沖單，按新成本價重掛對沖
         if prev_net != 0.0 and (net > 0) == (prev_net > 0) and current_size > abs(prev_net) + min_qty / 10:
             logger.info(
                 "檢測到加倉成交: 舊倉位=%s, 新倉位=%s",
@@ -752,10 +777,7 @@ class _PureMakerMixin:
                 format_balance(net),
             )
 
-            try:
-                self.cancel_existing_orders()
-            except Exception as exc:
-                logger.error("取消舊掛單失敗: %s", exc)
+            self._cancel_close_order()
 
             hedge_side = "Ask" if direction == "LONG" else "Bid"
             exit_price = self._determine_exit_price(position_state, avg_entry)
@@ -777,13 +799,6 @@ class _PureMakerMixin:
                 )
 
             self._scale_in_last_ref_price = avg_entry
-            self._place_scale_in_ladder(
-                direction=direction,
-                base_price=avg_entry,
-                current_size=current_size,
-                max_position=max_position,
-                step_ratio=step_ratio,
-            )
 
     def _place_scale_in_ladder(
         self,
@@ -792,21 +807,28 @@ class _PureMakerMixin:
         current_size: float,
         max_position: float,
         step_ratio: float,
-    ) -> None:
-        """根據當前持倉與配置一次性掛出剩餘所有加倉單。"""
+    ) -> bool:
+        """根據當前持倉與配置一次性掛出剩餘所有加倉單。
+
+        返回 True 表示至少成功掛出一筆加倉單。
+        """
         min_qty = getattr(self, "min_order_size", 0.0)
         if max_position <= 0.0 or current_size >= max_position - min_qty / 2:
             logger.info("持倉已接近或達到最大上限，無需額外加倉單")
-            return
+            return False
 
         if self.scale_in_size_pct <= 0.0 or step_ratio <= 0.0:
             logger.info("未設定有效的加倉步長/比例，跳過加倉梯度")
-            return
+            return False
+
+        price_step = abs(base_price) * step_ratio
+        if price_step <= 0:
+            logger.info("加倉價格步長無效，跳過加倉梯度")
+            return False
 
         # 初始化
         remaining_size = current_size
         level = 0
-        current_price = base_price
         orders_placed = 0
 
         while remaining_size + min_qty <= max_position:
@@ -827,18 +849,13 @@ class _PureMakerMixin:
 
             level += 1
             if direction == "LONG":
-                price_factor = 1.0 - step_ratio
-                if price_factor <= 0:
-                    logger.warning("加倉價格係數<=0，停止掛單")
-                    break
-                current_price *= price_factor
+                price = base_price - price_step * level
                 side = "Bid"
             else:
-                price_factor = 1.0 + step_ratio
-                current_price *= price_factor
+                price = base_price + price_step * level
                 side = "Ask"
 
-            price = round_to_tick_size(current_price, self.tick_size)
+            price = round_to_tick_size(price, self.tick_size)
             if price <= 0:
                 logger.warning("加倉價計算結果<=0（方向=%s），停止掛單", direction)
                 break
@@ -870,6 +887,10 @@ class _PureMakerMixin:
 
         if orders_placed == 0:
             logger.info("未能掛出任何加倉梯度（方向=%s）", direction)
+            return False
+
+        logger.info("已掛出 %d 筆加倉梯度訂單", orders_placed)
+        return True
 
     def run(self, duration_seconds: int = 3600, interval_seconds: int = 60):  # type: ignore[override]
         """純 Maker-Maker 策略運行入口（事件驅動，不使用 interval 輪詢）。
