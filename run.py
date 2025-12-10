@@ -40,6 +40,8 @@ def parse_arguments():
     parser.add_argument('--inventory-skew', type=float, default=0.0, help='永續倉位偏移調整係數 (0-1)')
     parser.add_argument('--stop-loss', type=float, help='永續倉位止損觸發值 (以報價資產計價)')
     parser.add_argument('--take-profit', type=float, help='永續倉位止盈觸發值 (以報價資產計價)')
+    parser.add_argument('--scale-in-price-step-pct', type=float, default=0.0, help='加倉觸發價格步長，單位為百分比，例如 0.1 代表價格每逆向 0.1% 觸發一次加倉')
+    parser.add_argument('--scale-in-size-pct', type=float, default=0.0, help='每次加倉相對當前持倉增加的百分比，例如 10 表示加倉當前倉位的 10%')
     parser.add_argument('--strategy', choices=['standard', 'maker_hedge', 'pure_maker', 'grid', 'perp_grid'], default='standard', help='策略選擇 (standard, maker_hedge, pure_maker, grid 或 perp_grid)')
 
     # 網格策略參數
@@ -316,6 +318,8 @@ def main():
                     )
                 elif strategy_name == 'pure_maker':
                     logger.info("啟動純 Maker-Maker 永續合約模式")
+                    logger.info(f"  加倉觸發步長: {args.scale_in_price_step_pct}%")
+                    logger.info(f"  加倉倉位比例: {args.scale_in_size_pct}%")
                     market_maker = PureMakerStrategy(
                         api_key=api_key,
                         secret_key=secret_key,
@@ -328,10 +332,12 @@ def main():
                         inventory_skew=args.inventory_skew,
                         stop_loss=args.stop_loss,
                         take_profit=args.take_profit,
-                            exchange=exchange,
+                        exchange=exchange,
                         exchange_config=exchange_config,
                         enable_database=args.enable_db,
-                        market_type='perp'
+                        market_type='perp',
+                        scale_in_price_step_pct=args.scale_in_price_step_pct,
+                        scale_in_size_pct=args.scale_in_size_pct,
                     )
                 else:
                     market_maker = PerpetualMarketMaker(
