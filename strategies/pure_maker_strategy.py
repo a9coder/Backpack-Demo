@@ -49,6 +49,7 @@ class _PureMakerMixin:
         self._next_round_delay = max(0.0, float(next_round_delay_seconds or 0.0))
         self._next_round_scheduled = False
         self._next_round_thread: Optional[threading.Thread] = None
+        self._restart_on_flat = False
         self._max_post_only_adjustments = 50
         
         # 成交追踪
@@ -169,6 +170,8 @@ class _PureMakerMixin:
                 logger.error(f"买单挂单失败: {result['error']}")
                 # 若下单失败，则清空本轮买单目标，避免无限等待
                 self._current_buy_order_qty = 0.0
+                self._handle_order_submission_failure("Bid", result)
+                return
             else:
                 logger.info(
                     "🟢 买单已挂出: 价格 %s, 数量 %s",
@@ -189,6 +192,8 @@ class _PureMakerMixin:
                 logger.error(f"卖单挂单失败: {result['error']}")
                 # 若下单失败，则清空本轮卖单目标，避免无限等待
                 self._current_sell_order_qty = 0.0
+                self._handle_order_submission_failure("Ask", result)
+                return
             else:
                 logger.info(
                     "🔴 卖单已挂出: 价格 %s, 数量 %s",
@@ -319,6 +324,84 @@ class _PureMakerMixin:
         self._ask_filled = False
         self.active_buy_orders = []
         self.active_sell_orders = []
+
+    def _start_cycle_async(self, delay: float = 0.0) -> None:
+        if getattr(self, "_stop_flag", False):
+            return
+
+        def _fire() -> None:
+            try:
+                if delay > 0:
+                    time.sleep(delay)
+                self.place_limit_orders()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("重新啟動掛單時出錯: %s", exc)
+
+        threading.Thread(target=_fire, daemon=True).start()
+
+    def _place_emergency_close_order(self, position_state: Optional[Dict[str, Any]]) -> bool:
+        if not position_state:
+            return False
+        min_qty = getattr(self, "min_order_size", 0.0)
+        net = float(position_state.get("net", 0.0) or 0.0)
+        if abs(net) < min_qty:
+            return False
+
+        qty = round_to_precision(abs(net), self.base_precision)
+        if qty < min_qty:
+            return False
+
+        hedge_side = "Ask" if net > 0 else "Bid"
+        fallback_price = float(position_state.get("avg_entry", 0.0) or 0.0)
+        exit_price = self._determine_exit_price(position_state, fallback_price)
+        result = self._place_post_only_perp_order(
+            side=hedge_side,
+            quantity=qty,
+            price=exit_price,
+            reduce_only=True,
+        )
+        if isinstance(result, dict) and "error" in result:
+            logger.error("緊急平倉單下發失敗: %s", result.get("error"))
+            return False
+
+        logger.info(
+            "已掛出緊急平倉單: 方向=%s, 價格=%.8f, 數量=%s",
+            hedge_side,
+            exit_price,
+            format_balance(qty),
+        )
+        return True
+
+    def _handle_order_submission_failure(self, side: str, error: Any) -> None:
+        logger.warning("方向 %s 掛單失敗，啟動恢復流程: %s", side, error)
+        try:
+            self.cancel_existing_orders()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("恢復流程取消訂單失敗: %s", exc)
+
+        self._reset_round_progress()
+
+        position_state: Optional[Dict[str, Any]] = None
+        if hasattr(self, "get_position_state"):
+            try:
+                position_state = self.get_position_state()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("恢復流程獲取倉位失敗: %s", exc)
+
+        min_qty = getattr(self, "min_order_size", 0.0)
+        net = 0.0
+        if position_state:
+            net = float(position_state.get("net", 0.0) or 0.0)
+
+        if position_state and abs(net) >= min_qty:
+            placed = self._place_emergency_close_order(position_state)
+            self._restart_on_flat = placed
+            if not placed:
+                logger.warning("緊急平倉單未成功掛出，暫停重新循環，請檢查倉位")
+        else:
+            self._restart_on_flat = False
+            # 略微延遲後重新開始一輪，避免立即命中相同價格
+            self._start_cycle_async(delay=1.0)
 
     def _is_post_only_immediate_match_error(self, error_message: Optional[str]) -> bool:
         if not error_message:
@@ -628,7 +711,11 @@ class _PureMakerMixin:
             except Exception as exc:
                 logger.error("取消剩余掛單失敗: %s", exc)
             self._reset_round_progress()
-            self._schedule_next_round()
+            if self._restart_on_flat:
+                self._restart_on_flat = False
+                self._start_cycle_async(delay=0.0)
+            else:
+                self._schedule_next_round()
             return
 
         # 更新記錄的上一筆倉位
