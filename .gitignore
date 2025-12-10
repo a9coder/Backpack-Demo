@@ -4,3 +4,5 @@ __pycache__/
 .env
 *.db
 .claude/settings.local.json
+.idea
+.gitignore

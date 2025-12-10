@@ -42,6 +42,7 @@ def parse_arguments():
     parser.add_argument('--take-profit', type=float, help='永續倉位止盈觸發值 (以報價資產計價)')
     parser.add_argument('--scale-in-price-step-pct', type=float, default=0.0, help='加倉觸發價格步長，單位為百分比，例如 0.1 代表價格每逆向 0.1% 觸發一次加倉')
     parser.add_argument('--scale-in-size-pct', type=float, default=0.0, help='每次加倉相對當前持倉增加的百分比，例如 10 表示加倉當前倉位的 10%')
+    parser.add_argument('--close-price-mode', choices=['entry', 'break_even'], default='entry', help='純Maker平倉價模式：entry=使用入場價格，break_even=使用盈虧平衡價')
     parser.add_argument('--strategy', choices=['standard', 'maker_hedge', 'pure_maker', 'grid', 'perp_grid'], default='standard', help='策略選擇 (standard, maker_hedge, pure_maker, grid 或 perp_grid)')
 
     # 網格策略參數
@@ -226,6 +227,10 @@ def main():
 
             strategy_name = args.strategy
 
+            if strategy_name == 'pure_maker' and (exchange != 'backpack' or market_type != 'perp'):
+                logger.error("純 Maker-Maker 策略目前僅支持 Backpack 永續合約，請設定 --exchange backpack 並使用 --market-type perp")
+                sys.exit(1)
+
             # 網格策略處理
             if strategy_name == 'grid':
                 logger.info("啟動現貨網格交易策略")
@@ -320,6 +325,7 @@ def main():
                     logger.info("啟動純 Maker-Maker 永續合約模式")
                     logger.info(f"  加倉觸發步長: {args.scale_in_price_step_pct}%")
                     logger.info(f"  加倉倉位比例: {args.scale_in_size_pct}%")
+                    logger.info(f"  平倉價格模式: {args.close_price_mode}")
                     market_maker = PureMakerStrategy(
                         api_key=api_key,
                         secret_key=secret_key,
@@ -338,6 +344,7 @@ def main():
                         market_type='perp',
                         scale_in_price_step_pct=args.scale_in_price_step_pct,
                         scale_in_size_pct=args.scale_in_size_pct,
+                        close_price_mode=args.close_price_mode,
                     )
                 else:
                     market_maker = PerpetualMarketMaker(

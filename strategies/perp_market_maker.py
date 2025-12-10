@@ -250,14 +250,25 @@ class PerpetualMarketMaker(MarketMaker):
         # 嘗試從API獲取更準確的信息
         position_info = self._get_actual_position_info()
         
+        break_even_price = 0.0
         if position_info:
             # 使用API返回的精確信息
             entry_price_raw = position_info.get("entryPrice", 0)
             pnl_raw = position_info.get("pnlUnrealized", 0)
+            break_even_raw = (
+                position_info.get("breakEvenPrice")
+                or position_info.get("breakevenPrice")
+                or position_info.get("break_even_price")
+            )
 
             # 安全處理可能為 None 的值
             avg_entry = float(entry_price_raw) if entry_price_raw is not None else 0.0
             unrealized = float(pnl_raw) if pnl_raw is not None else 0.0
+            if break_even_raw not in (None, ""):
+                try:
+                    break_even_price = float(break_even_raw)
+                except (TypeError, ValueError):
+                    break_even_price = 0.0
         else:
             # 使用本地計算作為備用
             if net > 0:
@@ -286,6 +297,7 @@ class PerpetualMarketMaker(MarketMaker):
             "leverage": self.leverage,
             "timestamp": datetime.utcnow().isoformat(),
             "current_price": current_price or 0.0,
+            "break_even_price": break_even_price if break_even_price > 0 else avg_entry,
         }
 
     def get_position_state(self) -> Dict[str, Any]:

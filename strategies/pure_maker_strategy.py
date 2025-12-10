@@ -1,6 +1,7 @@
 """纯 Maker-Maker 策略：仅挂买一/卖一，双向成交后继续循环。"""
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -21,6 +22,8 @@ class _PureMakerMixin:
         strategy_label: str = "纯Maker",
         scale_in_price_step_pct: float = 0.0,
         scale_in_size_pct: float = 0.0,
+        close_price_mode: str = "entry",
+        next_round_delay_seconds: float = 3.0,
         **kwargs: Any,
     ) -> None:
         # 强制单层订单，禁用重平衡
@@ -39,6 +42,13 @@ class _PureMakerMixin:
         self.scale_in_size_pct = max(0.0, float(scale_in_size_pct or 0.0))
         self._scale_in_last_ref_price = 0.0
         self._scale_in_last_net = 0.0
+        close_mode = str(close_price_mode or "entry").lower()
+        if close_mode not in {"entry", "break_even"}:
+            close_mode = "entry"
+        self.close_price_mode = close_mode
+        self._next_round_delay = max(0.0, float(next_round_delay_seconds or 0.0))
+        self._next_round_scheduled = False
+        self._next_round_thread: Optional[threading.Thread] = None
         
         # 成交追踪
         self._bid_filled = False
@@ -233,6 +243,72 @@ class _PureMakerMixin:
         return buy_qty, sell_qty
 
     # ------------------------------------------------------------------
+    # 轮次控制
+    # ------------------------------------------------------------------
+    def _is_position_flat(self) -> bool:
+        if hasattr(self, "get_position_state"):
+            try:
+                position_state = self.get_position_state()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("檢查倉位時出錯，暫不啟動下一輪: %s", exc)
+                return False
+            net = float(position_state.get("net", 0.0) or 0.0)
+            tolerance = max(self._fill_tolerance, getattr(self, "min_order_size", 0.0) / 10)
+            return abs(net) <= tolerance
+        return True
+
+    def _schedule_next_round(self) -> None:
+        if getattr(self, "_stop_flag", False):
+            return
+        if self._next_round_scheduled:
+            return
+        self._next_round_scheduled = True
+
+        def _fire() -> None:
+            try:
+                if self._next_round_delay > 0:
+                    logger.info("倉位已平，%.1f 秒後啟動下一輪掛單", self._next_round_delay)
+                    time.sleep(self._next_round_delay)
+                else:
+                    logger.info("倉位已平，立即啟動下一輪掛單")
+                self.place_limit_orders()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("啟動下一輪掛單時出錯: %s", exc)
+            finally:
+                self._next_round_scheduled = False
+
+        self._next_round_thread = threading.Thread(target=_fire, daemon=True)
+        self._next_round_thread.start()
+
+    def _maybe_trigger_next_round(self) -> None:
+        if not (self._bid_filled and self._ask_filled):
+            return
+        if not self._is_position_flat():
+            logger.debug("倉位尚未完全平倉，暫不啟動下一輪")
+            return
+        self._schedule_next_round()
+
+    def _determine_exit_price(self, position_state: Optional[Dict[str, Any]], fallback: float) -> float:
+        if self.close_price_mode != "break_even" or not position_state:
+            return fallback
+        for key in ("break_even_price", "breakEvenPrice", "breakevenPrice"):
+            price = position_state.get(key)
+            if price:
+                try:
+                    price_val = float(price)
+                except (TypeError, ValueError):
+                    continue
+                if price_val > 0:
+                    return price_val
+        avg_entry = position_state.get("avg_entry")
+        if avg_entry:
+            try:
+                return float(avg_entry)
+            except (TypeError, ValueError):
+                return fallback
+        return fallback
+
+    # ------------------------------------------------------------------
     # 成交后置处理
     # ------------------------------------------------------------------
     def _after_fill_processed(self, fill_info: Dict[str, Any]) -> None:
@@ -265,13 +341,9 @@ class _PureMakerMixin:
                 self._ask_filled = True
                 logger.info("✅ 卖单已全部成交")
 
-        # 利潤估算暫保持簡化處理，可根據實際需求再精細化
-        if self._bid_filled and self._ask_filled:
-            # 等待下一轮掛單時在 place_limit_orders 中統計輪次與利潤
-            pass
-
         # 永续合约纯Maker的加仓/对冲逻辑（基于成交事件触发）
         self._handle_perp_scale_and_hedge(side=side, quantity=quantity, price=price)
+        self._maybe_trigger_next_round()
 
     # ------------------------------------------------------------------
     # 加仓与平仓逻辑（永续合约专用）
@@ -406,11 +478,13 @@ class _PureMakerMixin:
 
         # 使用 reduceOnly 限價單，在成本價附近平掉「全部預期倉位」
         close_order_side = "Ask" if close_side == "long" else "Bid"
+        exit_price = self._determine_exit_price(position_state, new_avg_price)
         close_result = self.open_position(
             side=close_order_side,
             quantity=expected_size,
-            price=new_avg_price,
+            price=exit_price,
             order_type="Limit",
+            reduce_only=True,
             post_only=True,
         )
         if isinstance(close_result, dict) and "error" in close_result:
@@ -419,7 +493,7 @@ class _PureMakerMixin:
             logger.info(
                 "已在成本价挂出平仓单: 方向=%s, 价格=%.8f, 数量=%s",
                 close_side,
-                new_avg_price,
+                exit_price,
                 format_balance(expected_size),
             )
 
@@ -457,17 +531,14 @@ class _PureMakerMixin:
 
         # 情況 1: 倉位從非 0 回到 0 -> 認為本輪結束，取消加倉單並開啟下一輪
         if net == 0.0 and abs(prev_net) >= min_qty:
-            logger.info("倉位已歸零，取消所有加倉/對沖掛單並進入下一輪純Maker循環")
+            logger.info("倉位已歸零，取消所有加倉/對沖掛單，準備進入下一輪純Maker循環")
             self._scale_in_last_ref_price = 0.0
             self._scale_in_last_net = 0.0
             try:
                 self.cancel_existing_orders()
             except Exception as exc:
                 logger.error("取消剩余掛單失敗: %s", exc)
-            try:
-                self.place_limit_orders()
-            except Exception as exc:
-                logger.error("開啟新一輪掛單失敗: %s", exc)
+            self._schedule_next_round()
             return
 
         # 更新記錄的上一筆倉位
@@ -510,7 +581,8 @@ class _PureMakerMixin:
                 logger.error("取消舊掛單失敗: %s", exc)
 
             hedge_side = "Ask" if direction == "LONG" else "Bid"
-            hedge_price = round_to_tick_size(avg_entry, self.tick_size)
+            exit_price = self._determine_exit_price(position_state, avg_entry)
+            hedge_price = round_to_tick_size(exit_price, self.tick_size)
             hedge_qty = round_to_precision(current_size, self.base_precision)
 
             if hedge_qty >= min_qty:
@@ -525,6 +597,7 @@ class _PureMakerMixin:
                     quantity=hedge_qty,
                     price=hedge_price,
                     order_type="Limit",
+                    reduce_only=True,
                     post_only=True,
                 )
 
@@ -695,6 +768,8 @@ class _SpotPureMakerStrategy(_PureMakerMixin, MarketMaker):
         order_quantity: Optional[float] = None,
         exchange: str = "backpack",
         exchange_config: Optional[Dict[str, Any]] = None,
+        close_price_mode: str = "entry",
+        next_round_delay_seconds: float = 3.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -706,6 +781,8 @@ class _SpotPureMakerStrategy(_PureMakerMixin, MarketMaker):
             exchange=exchange,
             exchange_config=exchange_config,
             strategy_label="现货纯Maker",
+            close_price_mode=close_price_mode,
+            next_round_delay_seconds=next_round_delay_seconds,
             **kwargs,
         )
 
@@ -730,6 +807,8 @@ class _PerpPureMakerStrategy(_PureMakerMixin, PerpetualMarketMaker):
         exchange_config: Optional[Dict[str, Any]] = None,
         scale_in_price_step_pct: float = 0.0,
         scale_in_size_pct: float = 0.0,
+        close_price_mode: str = "entry",
+        next_round_delay_seconds: float = 3.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -749,6 +828,8 @@ class _PerpPureMakerStrategy(_PureMakerMixin, PerpetualMarketMaker):
             strategy_label="永续纯Maker",
             scale_in_price_step_pct=scale_in_price_step_pct,
             scale_in_size_pct=scale_in_size_pct,
+            close_price_mode=close_price_mode,
+            next_round_delay_seconds=next_round_delay_seconds,
             **kwargs,
         )
 
