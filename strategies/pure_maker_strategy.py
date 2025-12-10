@@ -42,29 +42,64 @@ class _PureMakerMixin:
         super().__init__(*args, **kwargs)
 
         self.max_orders = 1
-        logger.info("初始化纯 Maker-Maker 策略 (%s)", self._strategy_label)
+        # 当前一轮挂单的目标数量与成交进度
+        self._current_buy_order_qty = 0.0
+        self._current_sell_order_qty = 0.0
+        self._buy_filled_qty = 0.0
+        self._sell_filled_qty = 0.0
+        # 完全成交的容忍误差（防止精度问题）
+        self._fill_tolerance = max(getattr(self, "min_order_size", 0.0) / 1000, 1e-8)
 
+        logger.info("初始化纯 Maker-Maker 策略 (%s)", self._strategy_label)
     # ------------------------------------------------------------------
     # 挂单逻辑
     # ------------------------------------------------------------------
     def place_limit_orders(self) -> None:
-        """仅在买一/卖一位置挂出 Post-Only 订单。"""
+        """仅在买一/卖一位置挂出 Post-Only 订单。
+
+        逻辑：
+        - 若当前一轮买/卖单尚未全部成交：不取消、不重下，继续等待成交
+        - 仅在上一轮双向完全成交后，才取消残余订单并挂出下一轮
+        """
 
         self.check_ws_connection()
-        
-        # 检查是否双向已成交
-        if self._bid_filled and self._ask_filled:
+
+        # 如果已有一轮挂单在进行，优先检查是否全部成交
+        if self._current_buy_order_qty > 0.0 or self._current_sell_order_qty > 0.0:
+            buy_done = (
+                self._current_buy_order_qty <= 0.0
+                or self._buy_filled_qty + self._fill_tolerance >= self._current_buy_order_qty
+            )
+            sell_done = (
+                self._current_sell_order_qty <= 0.0
+                or self._sell_filled_qty + self._fill_tolerance >= self._current_sell_order_qty
+            )
+
+            if not (buy_done and sell_done):
+                logger.debug(
+                    "当前一轮挂单尚未全部成交，保持原有挂单不变（买已完成=%s, 卖已完成=%s）",
+                    buy_done,
+                    sell_done,
+                )
+                return
+
+            # 当前一轮已全部成交，可以开始新一轮
             self._round_count += 1
             logger.info(
-                "✅ 第 %d 轮双向成交完成，累计利润约 %.8f %s，开始新一轮",
+                "✅ 第 %d 轮双向完全成交，累计估算利润约 %.8f %s，准备挂出新一轮",
                 self._round_count,
                 self._total_profit_quote,
                 self.quote_asset,
             )
+            # 重置进度，准备新一轮
             self._bid_filled = False
             self._ask_filled = False
+            self._current_buy_order_qty = 0.0
+            self._current_sell_order_qty = 0.0
+            self._buy_filled_qty = 0.0
+            self._sell_filled_qty = 0.0
 
-        # 取消现有订单
+        # 只有在上一轮结束（或首轮）时才会走到这里：可以取消旧订单并挂出新一轮
         self.cancel_existing_orders()
 
         bid_price, ask_price = self.get_market_depth()
@@ -87,11 +122,19 @@ class _PureMakerMixin:
             logger.warning("无法计算挂单数量，跳过本轮")
             return
 
+        # 记录本轮目标数量与进度
+        self._current_buy_order_qty = buy_qty
+        self._current_sell_order_qty = sell_qty
+        self._buy_filled_qty = 0.0
+        self._sell_filled_qty = 0.0
+        self._bid_filled = False
+        self._ask_filled = False
+
         self.active_buy_orders = []
         self.active_sell_orders = []
 
-        # 只挂未成交的方向
-        if not self._bid_filled and buy_qty >= self.min_order_size:
+        # 只挂未成交的方向（首轮两侧都会挂出）
+        if buy_qty >= self.min_order_size:
             buy_order = self._build_limit_order(
                 side="Bid",
                 price=buy_price,
@@ -100,6 +143,8 @@ class _PureMakerMixin:
             result = self._submit_order(buy_order, slot="limit")
             if isinstance(result, dict) and "error" in result:
                 logger.error(f"买单挂单失败: {result['error']}")
+                # 若下单失败，则清空本轮买单目标，避免无限等待
+                self._current_buy_order_qty = 0.0
             else:
                 logger.info(
                     "🟢 买单已挂出: 价格 %s, 数量 %s",
@@ -109,7 +154,7 @@ class _PureMakerMixin:
                 self.active_buy_orders.append(result)
                 self.orders_placed += 1
 
-        if not self._ask_filled and sell_qty >= self.min_order_size:
+        if sell_qty >= self.min_order_size:
             sell_order = self._build_limit_order(
                 side="Ask",
                 price=sell_price,
@@ -118,6 +163,8 @@ class _PureMakerMixin:
             result = self._submit_order(sell_order, slot="limit")
             if isinstance(result, dict) and "error" in result:
                 logger.error(f"卖单挂单失败: {result['error']}")
+                # 若下单失败，则清空本轮卖单目标，避免无限等待
+                self._current_sell_order_qty = 0.0
             else:
                 logger.info(
                     "🔴 卖单已挂出: 价格 %s, 数量 %s",
@@ -176,7 +223,10 @@ class _PureMakerMixin:
     # 成交后置处理
     # ------------------------------------------------------------------
     def _after_fill_processed(self, fill_info: Dict[str, Any]) -> None:
-        """记录成交，不进行对冲。"""
+        """记录成交，不进行对冲，只更新本轮成交进度。
+
+        僅當買單與賣單「全部成交」後，下一輪掛單才會在 `place_limit_orders` 中啟動。
+        """
 
         super()._after_fill_processed(fill_info)
 
@@ -188,17 +238,23 @@ class _PureMakerMixin:
             logger.warning("成交信息不完整，跳过处理")
             return
 
-        # 记录成交状态
+        # 更新當前一輪的成交累計，僅當累計數量達到目標時才視為「完全成交」
         if side == "Bid":
-            self._bid_filled = True
-            logger.info("💰 买单成交: %.8f @ %.8f", quantity, price)
+            self._buy_filled_qty += quantity
+            logger.info("💰 买单成交: 累计 %.8f / 目标 %.8f @ %.8f", self._buy_filled_qty, self._current_buy_order_qty, price)
+            if self._current_buy_order_qty > 0.0 and self._buy_filled_qty + self._fill_tolerance >= self._current_buy_order_qty:
+                self._bid_filled = True
+                logger.info("✅ 买单已全部成交")
         elif side == "Ask":
-            self._ask_filled = True
-            logger.info("💰 卖单成交: %.8f @ %.8f", quantity, price)
-            
-        # 估算利润（简化计算：卖价 - 买价）
+            self._sell_filled_qty += quantity
+            logger.info("💰 卖单成交: 累计 %.8f / 目标 %.8f @ %.8f", self._sell_filled_qty, self._current_sell_order_qty, price)
+            if self._current_sell_order_qty > 0.0 and self._sell_filled_qty + self._fill_tolerance >= self._current_sell_order_qty:
+                self._ask_filled = True
+                logger.info("✅ 卖单已全部成交")
+
+        # 利潤估算暫保持簡化處理，可根據實際需求再精細化
         if self._bid_filled and self._ask_filled:
-            # 等待下一轮挂单时统计
+            # 等待下一轮掛單時在 place_limit_orders 中統計輪次與利潤
             pass
 
     # ------------------------------------------------------------------
