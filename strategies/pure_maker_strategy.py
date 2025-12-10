@@ -51,6 +51,7 @@ class _PureMakerMixin:
         self._next_round_thread: Optional[threading.Thread] = None
         self._restart_on_flat = False
         self._max_post_only_adjustments = 50
+        self._initial_orders_cancelled = False
         self._current_close_order_id: Optional[str] = None
         self._scale_ladder_deployed = False
         
@@ -338,6 +339,7 @@ class _PureMakerMixin:
         self._scale_ladder_deployed = False
         self._current_close_order_id = None
         self._initial_order_ids = {}
+        self._initial_orders_cancelled = False
 
     def _start_cycle_async(self, delay: float = 0.0) -> None:
         if getattr(self, "_stop_flag", False):
@@ -404,6 +406,8 @@ class _PureMakerMixin:
                     self._initial_order_ids.pop(side_label, None)
             except Exception as exc:  # noqa: BLE001
                 logger.error("取消初始 %s 訂單 %s 出錯: %s", side_label, order_id, exc)
+        if not self._initial_order_ids:
+            self._initial_orders_cancelled = True
 
     def _cancel_close_order(self) -> None:
         """取消已記錄的 reduce-only 平倉單，並同步檢查其他 reduce-only 掛單是否存在。"""
@@ -844,7 +848,8 @@ class _PureMakerMixin:
                 format_balance(net),
             )
 
-            self._cancel_initial_orders()
+            if not self._initial_orders_cancelled:
+                self._cancel_initial_orders()
             self._cancel_close_order()
 
             hedge_side = "Ask" if direction == "LONG" else "Bid"
