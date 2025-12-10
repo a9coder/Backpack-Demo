@@ -404,21 +404,25 @@ class _PureMakerMixin:
 
         new_avg_price = (avg_entry * current_size + entry_price * add_qty) / expected_size
 
-        close_ok = self.close_position(
+        # 使用 reduceOnly 限價單，在成本價附近平掉「全部預期倉位」
+        close_order_side = "Ask" if close_side == "long" else "Bid"
+        close_result = self.open_position(
+            side=close_order_side,
             quantity=expected_size,
             price=new_avg_price,
             order_type="Limit",
-            side=close_side,
+            reduce_only=True,
+            post_only=True,
         )
-        if close_ok:
+        if isinstance(close_result, dict) and "error" in close_result:
+            logger.warning("平仓挂单失败: %s", close_result.get("error"))
+        else:
             logger.info(
                 "已在成本价挂出平仓单: 方向=%s, 价格=%.8f, 数量=%s",
                 close_side,
                 new_avg_price,
                 format_balance(expected_size),
             )
-        else:
-            logger.warning("平仓挂单失败，将在后续迭代中重试")
 
         # 更新下一档加仓的参考价格
         self._scale_in_last_ref_price = current_price
