@@ -49,6 +49,7 @@ class _PureMakerMixin:
         self._next_round_delay = max(0.0, float(next_round_delay_seconds or 0.0))
         self._next_round_scheduled = False
         self._next_round_thread: Optional[threading.Thread] = None
+        self._max_post_only_adjustments = 50
         
         # 成交追踪
         self._bid_filled = False
@@ -308,6 +309,87 @@ class _PureMakerMixin:
                 return fallback
         return fallback
 
+    def _is_post_only_immediate_match_error(self, error_message: Optional[str]) -> bool:
+        if not error_message:
+            return False
+        text = str(error_message).lower()
+        if "immediately match" in text:
+            return True
+        if "post-only" in text or "post only" in text:
+            return True
+        if "would be taker" in text:
+            return True
+        return False
+
+    def _adjust_price_for_post_only(self, side: str, price: float) -> float:
+        tick = getattr(self, "tick_size", 0.0) or 0.0
+        if tick <= 0:
+            return price
+        normalized_side = (side or "").lower()
+        if normalized_side == "bid":
+            new_price = price - tick
+            if new_price <= 0:
+                return price
+            return round_to_tick_size(new_price, tick)
+        new_price = price + tick
+        return round_to_tick_size(new_price, tick)
+
+    def _place_post_only_perp_order(
+        self,
+        *,
+        side: str,
+        quantity: float,
+        price: float,
+        reduce_only: bool,
+    ) -> Any:
+        """下發 Post-Only 限價單，若因即時成交被拒則自動調整一檔價格再試。"""
+        current_price = price
+        attempts = 0
+        last_result: Any = None
+
+        while attempts <= self._max_post_only_adjustments:
+            last_result = self.open_position(
+                side=side,
+                quantity=quantity,
+                price=current_price,
+                order_type="Limit",
+                reduce_only=reduce_only,
+                post_only=True,
+            )
+
+            if not (isinstance(last_result, dict) and "error" in last_result):
+                return last_result
+
+            error_text = str(last_result.get("error"))
+            if not self._is_post_only_immediate_match_error(error_text):
+                return last_result
+
+            adjusted_price = self._adjust_price_for_post_only(side, current_price)
+            if adjusted_price == current_price or adjusted_price <= 0:
+                logger.error(
+                    "Post-only 價格調整失敗 (方向=%s, 原價=%s)，無法繼續遠離當前價格",
+                    side,
+                    format_balance(current_price),
+                )
+                return last_result
+
+            attempts += 1
+            logger.warning(
+                "Post-only 價格 %s 被拒 (立即成交)，嘗試第 %d 檔價格 %s",
+                format_balance(current_price),
+                attempts,
+                format_balance(adjusted_price),
+            )
+            current_price = adjusted_price
+
+        logger.error(
+            "Post-only 價格已調整 %d 次仍無法成功下單 (方向=%s, 最終價格=%s)",
+            self._max_post_only_adjustments,
+            side,
+            format_balance(current_price),
+        )
+        return last_result
+
     # ------------------------------------------------------------------
     # 成交后置处理
     # ------------------------------------------------------------------
@@ -455,13 +537,11 @@ class _PureMakerMixin:
             entry_price = round_to_tick_size(ask_price, self.tick_size)
             close_side = "short"
 
-        entry_result = self.open_position(
+        entry_result = self._place_post_only_perp_order(
             side=entry_side,
             quantity=add_qty,
             price=entry_price,
-            order_type="Limit",
             reduce_only=False,
-            post_only=True,
         )
         if isinstance(entry_result, dict) and "error" in entry_result:
             logger.error("加仓下单失败: %s", entry_result.get("error"))
@@ -479,13 +559,11 @@ class _PureMakerMixin:
         # 使用 reduceOnly 限價單，在成本價附近平掉「全部預期倉位」
         close_order_side = "Ask" if close_side == "long" else "Bid"
         exit_price = self._determine_exit_price(position_state, new_avg_price)
-        close_result = self.open_position(
+        close_result = self._place_post_only_perp_order(
             side=close_order_side,
             quantity=expected_size,
             price=exit_price,
-            order_type="Limit",
             reduce_only=True,
-            post_only=True,
         )
         if isinstance(close_result, dict) and "error" in close_result:
             logger.warning("平仓挂单失败: %s", close_result.get("error"))
@@ -592,13 +670,11 @@ class _PureMakerMixin:
                     hedge_price,
                     format_balance(hedge_qty),
                 )
-                self.open_position(
+                self._place_post_only_perp_order(
                     side=hedge_side,
                     quantity=hedge_qty,
                     price=hedge_price,
-                    order_type="Limit",
                     reduce_only=True,
-                    post_only=True,
                 )
 
             self._scale_in_last_ref_price = avg_entry
@@ -653,12 +729,11 @@ class _PureMakerMixin:
             price,
             format_balance(add_qty),
         )
-        self.open_position(
+        self._place_post_only_perp_order(
             side=side,
             quantity=add_qty,
             price=price,
-            order_type="Limit",
-            post_only=True,
+            reduce_only=False,
         )
 
     def run(self, duration_seconds: int = 3600, interval_seconds: int = 60):  # type: ignore[override]
