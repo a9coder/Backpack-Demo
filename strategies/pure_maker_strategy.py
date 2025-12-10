@@ -159,6 +159,7 @@ class _PureMakerMixin:
 
         self.active_buy_orders = []
         self.active_sell_orders = []
+        self._initial_order_ids: Dict[str, str] = {}
 
         # 只挂未成交的方向（首轮两侧都会挂出）
         if buy_qty >= self.min_order_size:
@@ -181,6 +182,10 @@ class _PureMakerMixin:
                     format_balance(buy_qty),
                 )
                 self.active_buy_orders.append(result)
+                if isinstance(result, dict):
+                    order_id = result.get("id")
+                    if order_id:
+                        self._initial_order_ids["Bid"] = str(order_id)
                 self.orders_placed += 1
 
         if sell_qty >= self.min_order_size:
@@ -203,6 +208,10 @@ class _PureMakerMixin:
                     format_balance(sell_qty),
                 )
                 self.active_sell_orders.append(result)
+                if isinstance(result, dict):
+                    order_id = result.get("id")
+                    if order_id:
+                        self._initial_order_ids["Ask"] = str(order_id)
                 self.orders_placed += 1
 
     def _determine_order_sizes(self, buy_price: float, sell_price: float) -> Tuple[Optional[float], Optional[float]]:
@@ -328,6 +337,7 @@ class _PureMakerMixin:
         self.active_sell_orders = []
         self._scale_ladder_deployed = False
         self._current_close_order_id = None
+        self._initial_order_ids = {}
 
     def _start_cycle_async(self, delay: float = 0.0) -> None:
         if getattr(self, "_stop_flag", False):
@@ -377,20 +387,69 @@ class _PureMakerMixin:
         )
         return True
 
-    def _cancel_close_order(self) -> None:
-        order_id = self._current_close_order_id
-        if not order_id:
+    def _cancel_initial_orders(self) -> None:
+        """取消最初掛出的買一/賣一訂單（若仍存在）。"""
+        if not self._initial_order_ids:
             return
+
+        for side_label, order_id in list(self._initial_order_ids.items()):
+            if not order_id:
+                continue
+            try:
+                result = self.client.cancel_order(order_id, self.symbol)
+                if isinstance(result, dict) and "error" in result:
+                    logger.warning("取消初始 %s 訂單 %s 失敗: %s", side_label, order_id, result.get("error"))
+                else:
+                    logger.info("已取消初始 %s 訂單 %s", side_label, order_id)
+                    self._initial_order_ids.pop(side_label, None)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("取消初始 %s 訂單 %s 出錯: %s", side_label, order_id, exc)
+
+    def _cancel_close_order(self) -> None:
+        """取消已記錄的 reduce-only 平倉單，並同步檢查其他 reduce-only 掛單是否存在。"""
+        order_id = self._current_close_order_id
+        if order_id:
+            try:
+                result = self.client.cancel_order(order_id, self.symbol)
+                if isinstance(result, dict) and "error" in result:
+                    logger.warning("取消平倉單 %s 失敗: %s", order_id, result.get("error"))
+                else:
+                    logger.info("已取消舊的平倉單 %s", order_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("取消平倉單 %s 出錯: %s", order_id, exc)
+            finally:
+                self._current_close_order_id = None
+
+        # 再遍歷一次當前掛單，確保沒有遺留的 reduce-only 掛單
         try:
-            result = self.client.cancel_order(order_id, self.symbol)
-            if isinstance(result, dict) and "error" in result:
-                logger.warning("取消平倉單 %s 失敗: %s", order_id, result.get("error"))
-            else:
-                logger.info("已取消舊的平倉單 %s", order_id)
+            open_orders = self.client.get_open_orders(self.symbol)
         except Exception as exc:  # noqa: BLE001
-            logger.error("取消平倉單 %s 出錯: %s", order_id, exc)
-        finally:
-            self._current_close_order_id = None
+            logger.warning("檢查遺留平倉單失敗: %s", exc)
+            return
+
+        if isinstance(open_orders, dict) and "error" in open_orders:
+            logger.warning("獲取掛單列表失敗: %s", open_orders.get("error"))
+            return
+
+        if not open_orders:
+            return
+
+        for order in open_orders:
+            try:
+                if not order:
+                    continue
+                if not order.get("reduceOnly"):
+                    continue
+                oid = order.get("id")
+                if not oid:
+                    continue
+                result = self.client.cancel_order(oid, self.symbol)
+                if isinstance(result, dict) and "error" in result:
+                    logger.warning("取消遺留平倉單 %s 失敗: %s", oid, result.get("error"))
+                else:
+                    logger.info("已取消遺留平倉單 %s", oid)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("取消遺留平倉單時出錯: %s", exc)
 
     def _handle_order_submission_failure(self, side: str, error: Any) -> None:
         logger.warning("方向 %s 掛單失敗，啟動恢復流程: %s", side, error)
@@ -766,6 +825,7 @@ class _PureMakerMixin:
             logger.info("檢測到首筆建倉完成，準備掛出第一檔加倉單")
             self._scale_in_last_ref_price = avg_entry
             if not self._scale_ladder_deployed:
+                self._cancel_initial_orders()
                 deployed = self._place_scale_in_ladder(
                     direction=direction,
                     base_price=avg_entry,
@@ -785,6 +845,7 @@ class _PureMakerMixin:
                 format_balance(net),
             )
 
+            self._cancel_initial_orders()
             self._cancel_close_order()
 
             hedge_side = "Ask" if direction == "LONG" else "Bid"
