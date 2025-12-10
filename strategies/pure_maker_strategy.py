@@ -588,6 +588,63 @@ class _PureMakerMixin:
             post_only=True,
         )
 
+    def run(self, duration_seconds: int = 3600, interval_seconds: int = 60):  # type: ignore[override]
+        """純 Maker-Maker 策略運行入口（事件驅動，不使用 interval 輪詢）。
+
+        - 初始在買一/賣一掛出對稱 Maker 單
+        - 後續完整循環由成交事件驅動（參見 `_after_fill_processed` / `_handle_perp_scale_and_hedge`）
+        - 不再在每次迭代中主動調用 `place_limit_orders`，也不輸出「等待 X 秒」日誌
+        """
+        logger.info(f"開始運行純 Maker-Maker 策略: {self.symbol}")
+        logger.info(f"運行時間上限: {duration_seconds} 秒 (事件驅動模式, interval 參數將被忽略)")
+
+        start_time = time.time()
+
+        try:
+            # 確保連接與數據流
+            connection_status = self.check_ws_connection()
+            if connection_status and getattr(self, "ws", None) is not None:
+                try:
+                    # 父類中已有的輔助方法，確保訂閲深度/行情/訂單更新流
+                    self._ensure_data_streams()  # type: ignore[attr-defined]
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("初始化數據流時出錯: %s", exc)
+
+            # 首次種子掛單：在買一/賣一掛出純 Maker 單
+            self.place_limit_orders()
+
+            # 事件驅動主循環：僅保持進程存活與適度打印統計，不做主動輪詢下單
+            report_interval = 300  # 每 5 分鐘打印一次簡要統計
+            last_report_time = start_time
+
+            while time.time() - start_time < duration_seconds and not getattr(self, "_stop_flag", False):
+                now_ts = time.time()
+
+                # 定期打印統計，但不干預交易邏輯
+                if now_ts - last_report_time >= report_interval:
+                    try:
+                        pnl_data = self.calculate_pnl()
+                        self.estimate_profit(pnl_data)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("打印統計時出錯: %s", exc)
+                    last_report_time = now_ts
+
+                # 輕量級 sleep，避免 CPU 忙等，不進行額外網絡請求
+                time.sleep(1)
+
+            logger.info("\n=== 純 Maker-Maker 策略運行結束 ===")
+            try:
+                self.print_trading_stats()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("打印最終交易統計時出錯: %s", exc)
+
+        except KeyboardInterrupt:
+            logger.info("\n用戶中斷，停止純 Maker-Maker 策略")
+            try:
+                self.print_trading_stats()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("打印中斷時交易統計時出錯: %s", exc)
+
     # ------------------------------------------------------------------
     # 节流与工具
     # ------------------------------------------------------------------
