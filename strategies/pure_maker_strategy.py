@@ -38,6 +38,7 @@ class _PureMakerMixin:
         self.scale_in_price_step_pct = max(0.0, float(scale_in_price_step_pct or 0.0))
         self.scale_in_size_pct = max(0.0, float(scale_in_size_pct or 0.0))
         self._scale_in_last_ref_price = 0.0
+        self._scale_in_last_net = 0.0
         
         # 成交追踪
         self._bid_filled = False
@@ -75,10 +76,6 @@ class _PureMakerMixin:
         """
 
         self.check_ws_connection()
-
-        # 若永续合约版本启用了加仓逻辑且当前有仓位，加仓/平仓逻辑将接管本轮挂单
-        if self._maybe_handle_scale_in():
-            return
 
         # 如果已有一轮挂单在进行，优先检查是否全部成交
         if self._current_buy_order_qty > 0.0 or self._current_sell_order_qty > 0.0:
@@ -273,6 +270,9 @@ class _PureMakerMixin:
             # 等待下一轮掛單時在 place_limit_orders 中統計輪次與利潤
             pass
 
+        # 永续合约纯Maker的加仓/对冲逻辑（基于成交事件触发）
+        self._handle_perp_scale_and_hedge(side=side, quantity=quantity, price=price)
+
     # ------------------------------------------------------------------
     # 加仓与平仓逻辑（永续合约专用）
     # ------------------------------------------------------------------
@@ -428,6 +428,165 @@ class _PureMakerMixin:
 
         # 进入加仓模式后，本轮不再执行普通Maker挂单
         return True
+
+    def _handle_perp_scale_and_hedge(self, side: str, quantity: float, price: float) -> None:
+        """永续合约纯Maker的加仓/对冲逻辑（以成交事件为驱动）。"""
+        # 若未配置加仓参数，或不是永续合约环境，则直接返回
+        if getattr(self, "scale_in_price_step_pct", 0.0) <= 0.0 or getattr(self, "scale_in_size_pct", 0.0) <= 0.0:
+            return
+        if not hasattr(self, "get_position_state") or not hasattr(self, "max_position"):
+            return
+
+        try:
+            position_state = self.get_position_state()
+        except Exception as exc:
+            logger.error("更新加仓/对冲时获取仓位失败: %s", exc)
+            return
+
+        net = float(position_state.get("net", 0.0) or 0.0)
+        direction = position_state.get("direction")
+        avg_entry = float(position_state.get("avg_entry", 0.0) or 0.0)
+        current_price = float(position_state.get("current_price", 0.0) or 0.0)
+
+        min_qty = getattr(self, "min_order_size", 0.0)
+        prev_net = getattr(self, "_scale_in_last_net", 0.0)
+
+        # 將極小倉位視為 0，避免噪音
+        if abs(net) < min_qty / 10:
+            net = 0.0
+
+        # 情況 1: 倉位從非 0 回到 0 -> 認為本輪結束，取消加倉單並開啟下一輪
+        if net == 0.0 and abs(prev_net) >= min_qty:
+            logger.info("倉位已歸零，取消所有加倉/對沖掛單並進入下一輪純Maker循環")
+            self._scale_in_last_ref_price = 0.0
+            self._scale_in_last_net = 0.0
+            try:
+                self.cancel_existing_orders()
+            except Exception as exc:
+                logger.error("取消剩余掛單失敗: %s", exc)
+            try:
+                self.place_limit_orders()
+            except Exception as exc:
+                logger.error("開啟新一輪掛單失敗: %s", exc)
+            return
+
+        # 更新記錄的上一筆倉位
+        self._scale_in_last_net = net
+
+        # 沒有有效持倉或缺少成本價/當前價信息時，不進行加倉/對沖處理
+        if net == 0.0 or not avg_entry or not current_price or direction not in ("LONG", "SHORT"):
+            return
+
+        current_size = abs(net)
+        step_ratio = self.scale_in_price_step_pct / 100.0
+        max_position = float(getattr(self, "max_position", 0.0) or 0.0)
+        if max_position <= 0.0:
+            return
+
+        # 情況 2: 首筆建倉完成（上一筆為 0，當前有持倉） -> 掛出第一筆加倉單
+        if abs(prev_net) < min_qty and current_size >= min_qty:
+            logger.info("檢測到首筆建倉完成，準備掛出第一檔加倉單")
+            self._scale_in_last_ref_price = avg_entry
+            self._place_next_scale_in_order(
+                direction=direction,
+                base_price=avg_entry,
+                current_size=current_size,
+                max_position=max_position,
+                step_ratio=step_ratio,
+            )
+            return
+
+        # 情況 3: 同方向持倉增加，視為加倉成交 -> 取消舊對沖單，按新成本價重掛對沖 + 下一檔加倉單
+        if prev_net != 0.0 and (net > 0) == (prev_net > 0) and current_size > abs(prev_net) + min_qty / 10:
+            logger.info(
+                "檢測到加倉成交: 舊倉位=%s, 新倉位=%s",
+                format_balance(prev_net),
+                format_balance(net),
+            )
+
+            try:
+                self.cancel_existing_orders()
+            except Exception as exc:
+                logger.error("取消舊掛單失敗: %s", exc)
+
+            hedge_side = "Ask" if direction == "LONG" else "Bid"
+            hedge_price = round_to_tick_size(avg_entry, self.tick_size)
+            hedge_qty = round_to_precision(current_size, self.base_precision)
+
+            if hedge_qty >= min_qty:
+                logger.info(
+                    "以成本價掛出新的對沖單: 方向=%s, 價格=%.8f, 數量=%s",
+                    hedge_side,
+                    hedge_price,
+                    format_balance(hedge_qty),
+                )
+                self.open_position(
+                    side=hedge_side,
+                    quantity=hedge_qty,
+                    price=hedge_price,
+                    order_type="Limit",
+                    post_only=True,
+                )
+
+            self._scale_in_last_ref_price = avg_entry
+            self._place_next_scale_in_order(
+                direction=direction,
+                base_price=avg_entry,
+                current_size=current_size,
+                max_position=max_position,
+                step_ratio=step_ratio,
+            )
+
+    def _place_next_scale_in_order(
+        self,
+        direction: str,
+        base_price: float,
+        current_size: float,
+        max_position: float,
+        step_ratio: float,
+    ) -> None:
+        """根據當前持倉與配置掛出下一檔加倉單。"""
+        min_qty = getattr(self, "min_order_size", 0.0)
+
+        if max_position <= 0.0 or current_size >= max_position:
+            logger.info("當前持倉已達到或超過最大倉位限制，不再掛出新的加倉單")
+            return
+
+        target_size = min(
+            max_position,
+            current_size * (1.0 + self.scale_in_size_pct / 100.0),
+        )
+        add_qty = max(0.0, target_size - current_size)
+        add_qty = round_to_precision(add_qty, self.base_precision)
+
+        if add_qty < min_qty:
+            logger.info(
+                "下一檔加倉數量 %s 低於最小下單單位 %s，跳過加倉單",
+                format_balance(add_qty),
+                format_balance(min_qty),
+            )
+            return
+
+        if direction == "LONG":
+            price = round_to_tick_size(base_price * (1.0 - step_ratio), self.tick_size)
+            side = "Bid"
+        else:
+            price = round_to_tick_size(base_price * (1.0 + step_ratio), self.tick_size)
+            side = "Ask"
+
+        logger.info(
+            "掛出下一檔加倉單: 方向=%s, 價格=%.8f, 數量=%s",
+            side,
+            price,
+            format_balance(add_qty),
+        )
+        self.open_position(
+            side=side,
+            quantity=add_qty,
+            price=price,
+            order_type="Limit",
+            post_only=True,
+        )
 
     # ------------------------------------------------------------------
     # 节流与工具
