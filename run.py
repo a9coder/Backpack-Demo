@@ -40,7 +40,7 @@ def parse_arguments():
     parser.add_argument('--inventory-skew', type=float, default=0.0, help='永續倉位偏移調整係數 (0-1)')
     parser.add_argument('--stop-loss', type=float, help='永續倉位止損觸發值 (以報價資產計價)')
     parser.add_argument('--take-profit', type=float, help='永續倉位止盈觸發值 (以報價資產計價)')
-    parser.add_argument('--strategy', choices=['standard', 'maker_hedge', 'grid', 'perp_grid'], default='standard', help='策略選擇 (standard, maker_hedge, grid 或 perp_grid)')
+    parser.add_argument('--strategy', choices=['standard', 'maker_hedge', 'pure_maker', 'grid', 'perp_grid'], default='standard', help='策略選擇 (standard, maker_hedge, pure_maker, grid 或 perp_grid)')
 
     # 網格策略參數
     parser.add_argument('--grid-upper', type=float, help='網格上限價格')
@@ -209,11 +209,12 @@ def main():
         except ImportError as e:
             logger.error(f"啟動命令行界面時出錯: {str(e)}")
             sys.exit(1)
-    elif args.symbol and (args.spread is not None or args.strategy in ['grid', 'perp_grid']):
+    elif args.symbol and (args.spread is not None or args.strategy in ['grid', 'perp_grid', 'pure_maker']):
         # 如果指定了交易對，直接運行策略（做市或網格）
         try:
             from strategies.market_maker import MarketMaker
             from strategies.maker_taker_hedge import MakerTakerHedgeStrategy
+            from strategies.pure_maker_strategy import PureMakerStrategy
             from strategies.perp_market_maker import PerpetualMarketMaker
             from strategies.grid_strategy import GridStrategy
             from strategies.perp_grid_strategy import PerpGridStrategy
@@ -313,6 +314,25 @@ def main():
                         enable_database=args.enable_db,
                         market_type='perp'
                     )
+                elif strategy_name == 'pure_maker':
+                    logger.info("啟動純 Maker-Maker 永續合約模式")
+                    market_maker = PureMakerStrategy(
+                        api_key=api_key,
+                        secret_key=secret_key,
+                        symbol=args.symbol,
+                        base_spread_percentage=0.0,
+                        order_quantity=args.quantity,
+                        target_position=args.target_position,
+                        max_position=args.max_position,
+                        position_threshold=args.position_threshold,
+                        inventory_skew=args.inventory_skew,
+                        stop_loss=args.stop_loss,
+                        take_profit=args.take_profit,
+                            exchange=exchange,
+                        exchange_config=exchange_config,
+                        enable_database=args.enable_db,
+                        market_type='perp'
+                    )
                 else:
                     market_maker = PerpetualMarketMaker(
                         api_key=api_key,
@@ -344,6 +364,19 @@ def main():
                         secret_key=secret_key,
                         symbol=args.symbol,
                         base_spread_percentage=args.spread,
+                        order_quantity=args.quantity,
+                            exchange=exchange,
+                        exchange_config=exchange_config,
+                        enable_database=args.enable_db,
+                        market_type='spot'
+                    )
+                elif strategy_name == 'pure_maker':
+                    logger.info("啟動純 Maker-Maker 現貨模式")
+                    market_maker = PureMakerStrategy(
+                        api_key=api_key,
+                        secret_key=secret_key,
+                        symbol=args.symbol,
+                        base_spread_percentage=0.0,
                         order_quantity=args.quantity,
                             exchange=exchange,
                         exchange_config=exchange_config,
