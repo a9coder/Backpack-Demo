@@ -825,7 +825,6 @@ class _PureMakerMixin:
             logger.info("檢測到首筆建倉完成，準備掛出第一檔加倉單")
             self._scale_in_last_ref_price = avg_entry
             if not self._scale_ladder_deployed:
-                self._cancel_initial_orders()
                 deployed = self._place_scale_in_ladder(
                     direction=direction,
                     base_price=avg_entry,
