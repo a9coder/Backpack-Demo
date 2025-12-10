@@ -358,6 +358,7 @@ class _PureMakerMixin:
         hedge_side = "Ask" if net > 0 else "Bid"
         fallback_price = float(position_state.get("avg_entry", 0.0) or 0.0)
         exit_price = self._determine_exit_price(position_state, fallback_price)
+        self._cancel_close_order()
         result = self._place_post_only_perp_order(
             side=hedge_side,
             quantity=qty,
@@ -520,6 +521,11 @@ class _PureMakerMixin:
         side = fill_info.get("side")
         quantity = float(fill_info.get("quantity", 0) or 0)
         price = float(fill_info.get("price", 0) or 0)
+        order_id = fill_info.get("order_id")
+
+        if order_id and self._current_close_order_id and str(order_id) == str(self._current_close_order_id):
+            logger.info("平倉單 %s 成交，清除追蹤 ID", order_id)
+            self._current_close_order_id = None
 
         if not side or quantity <= 0 or price <= 0:
             logger.warning("成交信息不完整，跳过处理")
@@ -675,6 +681,7 @@ class _PureMakerMixin:
         # 使用 reduceOnly 限價單，在成本價附近平掉「全部預期倉位」
         close_order_side = "Ask" if close_side == "long" else "Bid"
         exit_price = self._determine_exit_price(position_state, new_avg_price)
+        self._cancel_close_order()
         close_result = self._place_post_only_perp_order(
             side=close_order_side,
             quantity=expected_size,
@@ -728,6 +735,7 @@ class _PureMakerMixin:
             logger.info("倉位已歸零，取消所有加倉/對沖掛單，準備進入下一輪純Maker循環")
             self._scale_in_last_ref_price = 0.0
             self._scale_in_last_net = 0.0
+            self._cancel_close_order()
             try:
                 self.cancel_existing_orders()
             except Exception as exc:
