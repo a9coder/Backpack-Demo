@@ -15,7 +15,14 @@ logger = setup_logger("pure_maker_strategy")
 class _PureMakerMixin:
     """纯 Maker 策略核心实现：仅在买一/卖一挂单，双向成交后继续。"""
 
-    def __init__(self, *args: Any, strategy_label: str = "纯Maker", **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        strategy_label: str = "纯Maker",
+        scale_in_price_step_pct: float = 0.0,
+        scale_in_size_pct: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
         # 强制单层订单，禁用重平衡
         kwargs.pop("max_orders", None)
         kwargs.pop("enable_rebalance", None)
@@ -26,6 +33,11 @@ class _PureMakerMixin:
         kwargs["enable_rebalance"] = False
 
         self._strategy_label = strategy_label
+
+        # 加仓配置（仅在永续合约策略中生效）
+        self.scale_in_price_step_pct = max(0.0, float(scale_in_price_step_pct or 0.0))
+        self.scale_in_size_pct = max(0.0, float(scale_in_size_pct or 0.0))
+        self._scale_in_last_ref_price = 0.0
         
         # 成交追踪
         self._bid_filled = False
@@ -63,6 +75,10 @@ class _PureMakerMixin:
         """
 
         self.check_ws_connection()
+
+        # 若永续合约版本启用了加仓逻辑且当前有仓位，加仓/平仓逻辑将接管本轮挂单
+        if self._maybe_handle_scale_in():
+            return
 
         # 如果已有一轮挂单在进行，优先检查是否全部成交
         if self._current_buy_order_qty > 0.0 or self._current_sell_order_qty > 0.0:
@@ -258,6 +274,159 @@ class _PureMakerMixin:
             pass
 
     # ------------------------------------------------------------------
+    # 加仓与平仓逻辑（永续合约专用）
+    # ------------------------------------------------------------------
+    def _maybe_handle_scale_in(self) -> bool:
+        """永续合约纯Maker的加仓/平仓逻辑。
+
+        返回 True 表示本轮已处理加仓/平仓且不再执行常规挂单；
+        返回 False 表示应继续执行常规挂单逻辑。
+        """
+        # 未开启加仓功能，直接执行常规挂单
+        if getattr(self, "scale_in_price_step_pct", 0.0) <= 0.0 or getattr(self, "scale_in_size_pct", 0.0) <= 0.0:
+            return False
+
+        # 仅在永续合约策略中生效（需要有仓位信息和最大持仓限制）
+        if not hasattr(self, "get_position_state") or not hasattr(self, "max_position"):
+            return False
+
+        try:
+            position_state = self.get_position_state()
+        except Exception as exc:
+            logger.error("获取仓位状态失败，跳过加仓检查: %s", exc)
+            return False
+
+        net = float(position_state.get("net", 0.0) or 0.0)
+        direction = position_state.get("direction")
+        current_price = float(position_state.get("current_price", 0.0) or 0.0)
+        avg_entry = float(position_state.get("avg_entry", 0.0) or 0.0)
+
+        # 无有效仓位则退出加仓模式，交给常规挂单处理
+        if abs(net) < getattr(self, "min_order_size", 0.0) or not current_price or not avg_entry:
+            self._scale_in_last_ref_price = 0.0
+            return False
+
+        max_position = float(getattr(self, "max_position", 0.0) or 0.0)
+        if max_position <= 0.0:
+            # 有仓位但没有有效上限，暂不再挂普通Maker单
+            return True
+
+        # 初始化参考价格为当前平均成本
+        if self._scale_in_last_ref_price <= 0.0:
+            self._scale_in_last_ref_price = avg_entry
+
+        step_ratio = self.scale_in_price_step_pct / 100.0
+        should_scale_in = False
+
+        if direction == "LONG":
+            trigger_price = self._scale_in_last_ref_price * (1.0 - step_ratio)
+            if current_price <= trigger_price:
+                should_scale_in = True
+        elif direction == "SHORT":
+            trigger_price = self._scale_in_last_ref_price * (1.0 + step_ratio)
+            if current_price >= trigger_price:
+                should_scale_in = True
+        else:
+            # FLAT 或未知方向，退出加仓模式
+            self._scale_in_last_ref_price = 0.0
+            return False
+
+        current_size = abs(net)
+
+        # 未触发新一档加仓，但已有仓位 -> 保持加仓模式，不再挂常规Maker单
+        if not should_scale_in:
+            return True
+
+        # 计算本次加仓数量：在当前仓位基础上增加 scale_in_size_pct%，但不超过 max_position
+        target_size = min(
+            max_position,
+            current_size * (1.0 + self.scale_in_size_pct / 100.0),
+        )
+        add_qty = max(0.0, target_size - current_size)
+        add_qty = round_to_precision(add_qty, self.base_precision)
+
+        if add_qty < self.min_order_size:
+            logger.info(
+                "加仓目标数量 %s 低于最小下单单位 %s，跳过加仓",
+                format_balance(add_qty),
+                format_balance(self.min_order_size),
+            )
+            self._scale_in_last_ref_price = current_price
+            return True
+
+        logger.info(
+            "触发加仓逻辑: 方向=%s, 当前价=%.8f, 参考价=%.8f, 当前仓位=%s, 计划加仓=%s, 最大仓位=%s",
+            direction,
+            current_price,
+            self._scale_in_last_ref_price,
+            format_balance(current_size),
+            format_balance(add_qty),
+            format_balance(max_position),
+        )
+
+        # 1) 取消当前所有挂单
+        self.cancel_existing_orders()
+
+        # 2) 在当前盘口附近挂出新的加仓单（Post-Only）
+        bid_price, ask_price = self.get_market_depth()
+        if bid_price is None or ask_price is None:
+            logger.warning("无法获取买一/卖一价格，加仓挂单跳过")
+            self._scale_in_last_ref_price = current_price
+            return True
+
+        if direction == "LONG":
+            entry_side = "Bid"
+            entry_price = round_to_tick_size(bid_price, self.tick_size)
+            close_side = "long"
+        else:
+            entry_side = "Ask"
+            entry_price = round_to_tick_size(ask_price, self.tick_size)
+            close_side = "short"
+
+        entry_result = self.open_position(
+            side=entry_side,
+            quantity=add_qty,
+            price=entry_price,
+            order_type="Limit",
+            reduce_only=False,
+            post_only=True,
+        )
+        if isinstance(entry_result, dict) and "error" in entry_result:
+            logger.error("加仓下单失败: %s", entry_result.get("error"))
+            self._scale_in_last_ref_price = current_price
+            return True
+
+        # 3) 预估新的平均成本，并在成本价挂出平仓单
+        expected_size = current_size + add_qty
+        if expected_size <= 0:
+            self._scale_in_last_ref_price = current_price
+            return True
+
+        new_avg_price = (avg_entry * current_size + entry_price * add_qty) / expected_size
+
+        close_ok = self.close_position(
+            quantity=expected_size,
+            price=new_avg_price,
+            order_type="Limit",
+            side=close_side,
+        )
+        if close_ok:
+            logger.info(
+                "已在成本价挂出平仓单: 方向=%s, 价格=%.8f, 数量=%s",
+                close_side,
+                new_avg_price,
+                format_balance(expected_size),
+            )
+        else:
+            logger.warning("平仓挂单失败，将在后续迭代中重试")
+
+        # 更新下一档加仓的参考价格
+        self._scale_in_last_ref_price = current_price
+
+        # 进入加仓模式后，本轮不再执行普通Maker挂单
+        return True
+
+    # ------------------------------------------------------------------
     # 节流与工具
     # ------------------------------------------------------------------
     def _respect_request_interval(self, slot: str) -> None:
@@ -340,6 +509,8 @@ class _PerpPureMakerStrategy(_PureMakerMixin, PerpetualMarketMaker):
         take_profit: Optional[float] = None,
         exchange: str = "backpack",
         exchange_config: Optional[Dict[str, Any]] = None,
+        scale_in_price_step_pct: float = 0.0,
+        scale_in_size_pct: float = 0.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -357,6 +528,8 @@ class _PerpPureMakerStrategy(_PureMakerMixin, PerpetualMarketMaker):
             exchange=exchange,
             exchange_config=exchange_config,
             strategy_label="永续纯Maker",
+            scale_in_price_step_pct=scale_in_price_step_pct,
+            scale_in_size_pct=scale_in_size_pct,
             **kwargs,
         )
 
