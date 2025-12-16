@@ -644,9 +644,11 @@ class _PureMakerMixin:
                 self._ask_filled = True
                 logger.info("✅ 卖单已全部成交")
 
-        # 永续合约纯Maker的加仓/对冲逻辑（基于成交事件触发）
-        self._handle_perp_scale_and_hedge(side=side, quantity=quantity, price=price)
         self._maybe_trigger_next_round()
+
+        # 无论当前是否已全部成交，只要有成交发生，就尝试检查加仓逻辑
+        # 移至 _maybe_trigger_next_round 之后，以防需要先进入下一轮
+        self._handle_perp_scale_and_hedge(side=side, quantity=quantity, price=price)
 
     # ------------------------------------------------------------------
     # 加仓与平仓逻辑（永续合约专用）
@@ -861,8 +863,9 @@ class _PureMakerMixin:
             return
 
         # 情況 2: 首筆建倉完成（上一筆為 0，當前有持倉） -> 掛出第一筆加倉單
-        if abs(prev_net) < min_qty and current_size >= min_qty:
-            logger.info("檢測到首筆建倉完成，準備掛出第一檔加倉單")
+        # 或者：当前有持倉，但尚未部署加仓梯队 -> 补充检查
+        if (abs(prev_net) < min_qty and current_size >= min_qty) or (current_size >= min_qty and not self._scale_ladder_deployed):
+            logger.info("檢測到建倉完成或加仓梯队未部署，準備掛出加倉單")
             self._scale_in_last_ref_price = avg_entry
             if not self._scale_ladder_deployed:
                 deployed = self._place_scale_in_ladder(
