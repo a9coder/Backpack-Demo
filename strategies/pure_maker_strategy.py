@@ -305,12 +305,33 @@ class _PureMakerMixin:
         self._next_round_thread.start()
 
     def _maybe_trigger_next_round(self) -> None:
-        if not (self._bid_filled and self._ask_filled):
+        """检查本轮是否结束，若结束则启动下一轮（或等待平仓）。"""
+        # 1. 检查挂单是否全部成交
+        buy_done = (
+            self._current_buy_order_qty <= 0.0
+            or self._buy_filled_qty + self._fill_tolerance >= self._current_buy_order_qty
+        )
+        sell_done = (
+            self._current_sell_order_qty <= 0.0
+            or self._sell_filled_qty + self._fill_tolerance >= self._current_sell_order_qty
+        )
+
+        if not (buy_done and sell_done):
+            # 本轮挂单还没跑完，不进行下一轮
             return
-        if not self._is_position_flat():
-            logger.debug("倉位尚未完全平倉，暫不啟動下一輪")
-            return
-        self._schedule_next_round()
+
+        logger.info("✅ 本轮双向挂单已全部成交，检查仓位状态准备进入下一轮...")
+        
+        # 2. 如果是现货或永续且仓位已平，直接下一轮
+        if self._is_position_flat():
+            logger.info("仓位已平 (Flat)，启动下一轮倒计时")
+            self._schedule_next_round()
+        else:
+            # 3. 永续有仓位：
+            #    此时意味着本轮虽然挂单结束，但可能触发了加仓/对冲逻辑（或者还未平仓）
+            #    如果进入了加仓模式，则由加仓/平仓逻辑接管，不再自动启动下一轮 Maker 循环
+            #    直到仓位归零 (在 _handle_perp_scale_and_hedge 中检测到 net=0)
+            logger.info("仓位未平 (Net != 0)，暂不启动新一轮 Maker 循环，等待平仓/加仓逻辑接管")
 
     def _determine_exit_price(self, position_state: Optional[Dict[str, Any]], fallback: float) -> float:
         if self.close_price_mode != "break_even" or not position_state:
@@ -857,15 +878,23 @@ class _PureMakerMixin:
             return
 
         current_size = abs(net)
-        step_ratio = self.scale_in_price_step_pct / 100.0
-        max_position = float(getattr(self, "max_position", 0.0) or 0.0)
         if max_position <= 0.0:
             return
 
-        # 情況 2: 首筆建倉完成（上一筆為 0，當前有持倉） -> 掛出第一筆加倉單
-        # 或者：当前有持倉，但尚未部署加仓梯队 -> 补充检查
-        if (abs(prev_net) < min_qty and current_size >= min_qty) or (current_size >= min_qty and not self._scale_ladder_deployed):
-            logger.info("檢測到建倉完成或加仓梯队未部署，準備掛出加倉單")
+        # 核心修复：放宽首笔触发条件
+        # 旧逻辑要求 abs(prev_net) < min_qty，但可能因为并发使得 prev_net 更新不及时或被置为0
+        # 新逻辑：只要当前有持仓，且未部署加仓梯队，就尝试部署
+        is_first_entry = (abs(prev_net) < min_qty and current_size >= min_qty)
+        missing_ladder = (current_size >= min_qty and not self._scale_ladder_deployed)
+
+        if is_first_entry or missing_ladder:
+            logger.info(
+                "触发加仓检查: 首笔=%s, 缺梯队=%s (当前仓位=%s, 上次仓位=%s)",
+                is_first_entry,
+                missing_ladder,
+                format_balance(current_size),
+                format_balance(prev_net),
+            )
             self._scale_in_last_ref_price = avg_entry
             if not self._scale_ladder_deployed:
                 deployed = self._place_scale_in_ladder(
