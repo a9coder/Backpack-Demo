@@ -125,9 +125,9 @@ class PureMakerStrategy(PerpetualMarketMaker):
         self._state_lock = threading.RLock()
         self._order_lock = threading.Lock()
         
-        # 成交事件去重
-        self._processed_fill_ids: Set[str] = set()
-        self._recent_fill_ids: deque = deque(maxlen=1000)
+        # 成交事件去重（使用独立的集合，避免与父类冲突）
+        self._pm_processed_fills: Set[str] = set()
+        self._pm_recent_fills: deque = deque(maxlen=1000)
         
         # 订单追踪表 order_id -> TrackedOrder
         self._tracked_orders: Dict[str, TrackedOrder] = {}
@@ -498,27 +498,26 @@ class PureMakerStrategy(PerpetualMarketMaker):
         """处理成交事件（覆盖父类方法）"""
         super()._after_fill_processed(fill_info)
         
-        # 去重检查
-        fill_id = fill_info.get("fill_id") or fill_info.get("trade_id") or fill_info.get("tradeId")
-        if fill_id:
-            fill_id_str = str(fill_id)
-            if fill_id_str in self._processed_fill_ids:
-                logger.debug("跳过重复的成交事件: %s", fill_id_str)
-                return
-            
-            self._processed_fill_ids.add(fill_id_str)
-            self._recent_fill_ids.append(fill_id_str)
-            
-            # 清理旧的记录
-            if len(self._processed_fill_ids) > 2000:
-                while len(self._recent_fill_ids) > 500:
-                    old_id = self._recent_fill_ids.popleft()
-                    self._processed_fill_ids.discard(old_id)
-        
         order_id = str(fill_info.get("order_id", ""))
         side = fill_info.get("side")
         quantity = float(fill_info.get("quantity", 0) or 0)
         price = float(fill_info.get("price", 0) or 0)
+        
+        # 去重检查：使用 order_id + quantity + price 组合作为唯一标识
+        # 避免与父类的 _processed_fill_ids 冲突
+        fill_key = f"{order_id}:{quantity}:{price}"
+        if fill_key in self._pm_processed_fills:
+            logger.debug("跳过重复的成交事件: %s", fill_key)
+            return
+        
+        self._pm_processed_fills.add(fill_key)
+        self._pm_recent_fills.append(fill_key)
+        
+        # 清理旧的记录
+        if len(self._pm_processed_fills) > 2000:
+            while len(self._pm_recent_fills) > 500:
+                old_key = self._pm_recent_fills.popleft()
+                self._pm_processed_fills.discard(old_key)
         
         if not order_id or not side or quantity <= 0:
             logger.warning("成交信息不完整: %s", fill_info)
