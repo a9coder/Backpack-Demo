@@ -730,7 +730,7 @@ class PureMakerStrategy(PerpetualMarketMaker):
         break_even_price: float,
         avg_entry: float,
     ) -> None:
-        """入场单成交处理"""
+        """入场单成交处理（支持部分成交）"""
         logger.info("🎯 入场单成交！方向=%s, 仓位=%s", direction, format_balance(net))
         
         # 检查：如果仓位为 0（可能是立即成交后又被平仓，或 API 返回延迟），直接进入下一轮
@@ -750,11 +750,15 @@ class PureMakerStrategy(PerpetualMarketMaker):
             return
         
         with self._state_lock:
-            # 记录入场订单
+            # 记录入场订单和方向
             self._round_state.entry_order = order
             self._round_state.position_direction = direction
+            
+            # 检查：是否已经处理过入场单成交（已有对冲单或加仓单）
+            already_has_hedge = self._round_state.hedge_order is not None
+            already_has_scale_in = len(self._round_state.scale_in_orders) > 0
         
-        # 取消另一侧的入场单
+        # 取消另一侧的入场单（这个可以重复执行，无副作用）
         if order.side == "Bid":
             self._cancel_entry_orders_except(keep_side="Bid")
         else:
@@ -767,34 +771,47 @@ class PureMakerStrategy(PerpetualMarketMaker):
         
         hedge_price = round_to_tick_size(hedge_price, self.tick_size)
         
-        # 确定对冲方向
+        # 确定对冲方向和数量
         current_size = abs(net)
         if direction == "LONG":
             hedge_side = "Ask"  # 多头需要卖出平仓
         else:
             hedge_side = "Bid"  # 空头需要买入平仓
         
-        logger.info("📤 准备挂对冲单: 方向=%s, 价格=%.8f, 数量=%s", 
-                    hedge_side, hedge_price, format_balance(current_size))
-        
-        # 挂对冲单
-        hedge_order = self._place_post_only_order(
-            side=hedge_side,
-            price=hedge_price,
-            quantity=current_size,
-            role=OrderRole.HEDGE,
-            reduce_only=True,
-        )
-        
-        if hedge_order:
+        # 处理对冲单
+        if already_has_hedge:
+            # 部分成交场景：已有对冲单，只需更新价格和数量
+            logger.info("🔄 [部分成交] 更新对冲单: 新价格=%.8f, 新数量=%s", 
+                        hedge_price, format_balance(current_size))
             with self._state_lock:
-                self._round_state.hedge_order = hedge_order
-            logger.info("✅ 对冲单已挂出")
+                if self._round_state.hedge_order:
+                    self._round_state.hedge_order.quantity = current_size
+            self._update_hedge_order_price(hedge_price)
         else:
-            logger.error("❌ 对冲单挂单失败")
+            # 首次成交：挂对冲单
+            logger.info("📤 准备挂对冲单: 方向=%s, 价格=%.8f, 数量=%s", 
+                        hedge_side, hedge_price, format_balance(current_size))
+            
+            hedge_order = self._place_post_only_order(
+                side=hedge_side,
+                price=hedge_price,
+                quantity=current_size,
+                role=OrderRole.HEDGE,
+                reduce_only=True,
+            )
+            
+            if hedge_order:
+                with self._state_lock:
+                    self._round_state.hedge_order = hedge_order
+                logger.info("✅ 对冲单已挂出")
+            else:
+                logger.error("❌ 对冲单挂单失败")
         
-        # 挂加仓订单
-        self._place_scale_in_orders(direction, avg_entry if avg_entry > 0 else order.price, current_size)
+        # 处理加仓单：只在首次成交时挂加仓单
+        if not already_has_scale_in:
+            self._place_scale_in_orders(direction, avg_entry if avg_entry > 0 else order.price, current_size)
+        else:
+            logger.info("🔄 [部分成交] 已有加仓单，跳过重复挂单")
 
     def _on_scale_in_order_filled(
         self,
@@ -906,11 +923,15 @@ class PureMakerStrategy(PerpetualMarketMaker):
         logger.info("=" * 60)
         logger.info("开始运行纯 Maker-Maker 刷量策略")
         logger.info("  运行时长: %d 秒", duration_seconds)
-        logger.info("  模式: 事件驱动")
+        logger.info("  模式: 事件驱动 + 定时容错检查")
         logger.info("=" * 60)
         
         start_time = time.time()
         self._stop_flag = False
+        
+        # 定时检查间隔
+        state_check_interval = 5  # 每5秒检查一次状态
+        last_state_check = start_time
         
         try:
             # 确保 WebSocket 连接
@@ -931,6 +952,11 @@ class PureMakerStrategy(PerpetualMarketMaker):
             while time.time() - start_time < duration_seconds and not self._stop_flag:
                 now = time.time()
                 
+                # 定时状态检查（容错机制）
+                if now - last_state_check >= state_check_interval:
+                    self._check_state_and_recover()
+                    last_state_check = now
+                
                 # 定期统计
                 if now - last_report >= report_interval:
                     self._print_stats()
@@ -949,6 +975,103 @@ class PureMakerStrategy(PerpetualMarketMaker):
             self._stop_flag = True
         finally:
             self._cancel_all_tracked_orders()
+
+    def _check_state_and_recover(self) -> None:
+        """定时检查状态并恢复（容错机制）
+        
+        当 WebSocket 漏推成交通知时，通过 API 查询实际状态来恢复
+        """
+        # 如果下一轮已在调度中，跳过检查
+        with self._next_round_lock:
+            if self._next_round_scheduled:
+                return
+        
+        # 如果当前轮次已完成，跳过
+        with self._state_lock:
+            if self._round_state.is_completed:
+                return
+        
+        try:
+            # 查询当前仓位
+            position_state = self.get_position_state()
+            net = float(position_state.get("net", 0.0) or 0.0)
+            direction = position_state.get("direction", "FLAT")
+            
+            # 查询当前挂单
+            open_orders = self.client.get_open_orders(self.symbol)
+            has_open_orders = False
+            if isinstance(open_orders, list):
+                has_open_orders = len(open_orders) > 0
+            elif isinstance(open_orders, dict) and "error" not in open_orders:
+                has_open_orders = True
+            
+            tolerance = self.min_order_size / 10
+            
+            # 情况1: 仓位为0 且 无挂单 -> 进入下一轮
+            if abs(net) <= tolerance and not has_open_orders:
+                logger.warning("⚠️ [定时检查] 仓位=0 且无挂单，可能 WS 漏推，自动进入下一轮")
+                with self._state_lock:
+                    self._round_state.is_completed = True
+                    self._tracked_orders.clear()
+                self._schedule_next_round()
+                return
+            
+            # 情况2: 有仓位 但 无挂单（对冲单/加仓单丢失）-> 需要补挂
+            if abs(net) > tolerance and not has_open_orders:
+                logger.warning("⚠️ [定时检查] 有仓位(%.4f) 但无挂单，尝试补挂对冲单", net)
+                self._recover_hedge_order(net, direction, position_state)
+                return
+            
+            # 其他情况正常，静默
+            
+        except Exception as e:
+            logger.debug("定时状态检查异常: %s", e)
+
+    def _recover_hedge_order(self, net: float, direction: str, position_state: Dict[str, Any]) -> None:
+        """恢复对冲单"""
+        break_even_price = float(position_state.get("break_even_price", 0.0) or 0.0)
+        avg_entry = float(position_state.get("avg_entry", 0.0) or 0.0)
+        
+        # 计算对冲价格
+        hedge_price = break_even_price if break_even_price > 0 else avg_entry
+        if hedge_price <= 0:
+            # 获取当前市场价格
+            bid_price, ask_price = self.get_market_depth()
+            if direction == "LONG":
+                hedge_price = ask_price if ask_price else 0
+            else:
+                hedge_price = bid_price if bid_price else 0
+        
+        if hedge_price <= 0:
+            logger.error("无法确定对冲价格，跳过恢复")
+            return
+        
+        hedge_price = round_to_tick_size(hedge_price, self.tick_size)
+        current_size = abs(net)
+        
+        # 确定对冲方向
+        if direction == "LONG":
+            hedge_side = "Ask"
+        else:
+            hedge_side = "Bid"
+        
+        logger.info("📤 [恢复] 补挂对冲单: 方向=%s, 价格=%.8f, 数量=%s",
+                    hedge_side, hedge_price, format_balance(current_size))
+        
+        # 挂对冲单
+        hedge_order = self._place_post_only_order(
+            side=hedge_side,
+            price=hedge_price,
+            quantity=current_size,
+            role=OrderRole.HEDGE,
+            reduce_only=True,
+        )
+        
+        if hedge_order:
+            with self._state_lock:
+                self._round_state.hedge_order = hedge_order
+                self._round_state.position_direction = direction
+            logger.info("✅ [恢复] 对冲单已补挂")
 
     def _print_stats(self) -> None:
         """打印统计信息"""
