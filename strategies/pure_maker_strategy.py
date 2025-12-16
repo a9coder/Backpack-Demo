@@ -48,6 +48,7 @@ class _PureMakerMixin:
         self.close_price_mode = close_mode
         self._next_round_delay = max(0.0, float(next_round_delay_seconds or 0.0))
         self._next_round_scheduled = False
+        self._next_round_lock = threading.Lock()  # 保护 _next_round_scheduled 的线程锁
         self._next_round_thread: Optional[threading.Thread] = None
         self._restart_on_flat = False
         self._max_post_only_adjustments = 50
@@ -60,6 +61,7 @@ class _PureMakerMixin:
         self._ask_filled = False
         self._round_count = 0
         self._total_profit_quote = 0.0  # 累计利润（报价资产）
+        self._processed_fill_ids: set = set()  # 用于成交事件去重
         
         # 请求限流
         self._request_intervals: Dict[str, float] = {
@@ -278,9 +280,12 @@ class _PureMakerMixin:
     def _schedule_next_round(self) -> None:
         if getattr(self, "_stop_flag", False):
             return
-        if self._next_round_scheduled:
-            return
-        self._next_round_scheduled = True
+        
+        # 使用线程锁保护，避免竞态条件
+        with self._next_round_lock:
+            if self._next_round_scheduled:
+                return
+            self._next_round_scheduled = True
 
         def _fire() -> None:
             try:
@@ -293,7 +298,8 @@ class _PureMakerMixin:
             except Exception as exc:  # noqa: BLE001
                 logger.error("啟動下一輪掛單時出錯: %s", exc)
             finally:
-                self._next_round_scheduled = False
+                with self._next_round_lock:
+                    self._next_round_scheduled = False
 
         self._next_round_thread = threading.Thread(target=_fire, daemon=True)
         self._next_round_thread.start()
@@ -400,7 +406,13 @@ class _PureMakerMixin:
             try:
                 result = self.client.cancel_order(order_id, self.symbol)
                 if isinstance(result, dict) and "error" in result:
-                    logger.warning("取消初始 %s 訂單 %s 失敗: %s", side_label, order_id, result.get("error"))
+                    error_msg = str(result.get("error", ""))
+                    # 如果订单不存在（已成交或已取消），视为成功，使用 debug 级别日志
+                    if "not found" in error_msg.lower() or "does not exist" in error_msg.lower():
+                        logger.debug("初始 %s 訂單 %s 已不存在（可能已成交），跳過取消", side_label, order_id)
+                        self._initial_order_ids.pop(side_label, None)
+                    else:
+                        logger.warning("取消初始 %s 訂單 %s 失敗: %s", side_label, order_id, error_msg)
                 else:
                     logger.info("已取消初始 %s 訂單 %s", side_label, order_id)
                     self._initial_order_ids.pop(side_label, None)
@@ -581,6 +593,21 @@ class _PureMakerMixin:
 
         super()._after_fill_processed(fill_info)
 
+        # 成交事件去重：防止 WebSocket 重复推送导致数量累加错误
+        fill_id = fill_info.get("fill_id") or fill_info.get("trade_id") or fill_info.get("tradeId")
+        if fill_id:
+            fill_id_str = str(fill_id)
+            if fill_id_str in self._processed_fill_ids:
+                logger.debug("跳过已处理的成交事件: %s", fill_id_str)
+                return
+            self._processed_fill_ids.add(fill_id_str)
+            # 防止集合无限增长，保留最近 1000 条记录
+            if len(self._processed_fill_ids) > 1000:
+                # 由于 set 无序，这里简单清空旧记录（实际生产环境可考虑使用 OrderedDict 或 LRU）
+                oldest_to_remove = list(self._processed_fill_ids)[:500]
+                for old_id in oldest_to_remove:
+                    self._processed_fill_ids.discard(old_id)
+
         side = fill_info.get("side")
         quantity = float(fill_info.get("quantity", 0) or 0)
         price = float(fill_info.get("price", 0) or 0)
@@ -589,6 +616,15 @@ class _PureMakerMixin:
         if order_id and self._current_close_order_id and str(order_id) == str(self._current_close_order_id):
             logger.info("平倉單 %s 成交，清除追蹤 ID", order_id)
             self._current_close_order_id = None
+
+        # 如果成交的订单是初始订单之一，立即从追踪列表中移除，避免后续取消时报错
+        if order_id and hasattr(self, "_initial_order_ids") and self._initial_order_ids:
+            order_id_str = str(order_id)
+            for side_label in list(self._initial_order_ids.keys()):
+                if str(self._initial_order_ids.get(side_label)) == order_id_str:
+                    logger.debug("初始 %s 訂單 %s 已成交，從追蹤列表移除", side_label, order_id_str)
+                    self._initial_order_ids.pop(side_label, None)
+                    break
 
         if not side or quantity <= 0 or price <= 0:
             logger.warning("成交信息不完整，跳过处理")
