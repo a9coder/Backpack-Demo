@@ -827,11 +827,15 @@ class _PureMakerMixin:
         return True
 
     def _handle_perp_scale_and_hedge(self, side: str, quantity: float, price: float) -> None:
-        """永续合约纯Maker的加仓/对冲逻辑（以成交事件为驱动）。"""
-        # 若未配置加仓参数，或不是永续合约环境，则直接返回
-        if getattr(self, "scale_in_price_step_pct", 0.0) <= 0.0 or getattr(self, "scale_in_size_pct", 0.0) <= 0.0:
-            return
-        if not hasattr(self, "get_position_state") or not hasattr(self, "max_position"):
+        """永续合约纯Maker的加仓/对冲逻辑（以成交事件为驱动）。
+        
+        核心逻辑：
+        1. 仓位归零 -> 启动下一轮
+        2. 首次产生仓位 -> 取消另一侧初始订单，挂对冲单，挂加仓梯队
+        3. 加仓成交 -> 更新对冲单价格和数量
+        """
+        # 仅在永续合约环境中生效
+        if not hasattr(self, "get_position_state"):
             return
 
         try:
@@ -873,30 +877,59 @@ class _PureMakerMixin:
         # 更新記錄的上一筆倉位
         self._scale_in_last_net = net
 
-        # 沒有有效持倉或缺少成本價/當前價信息時，不進行加倉/對沖處理
-        if net == 0.0 or not avg_entry or not current_price or direction not in ("LONG", "SHORT"):
+        # 沒有有效持倉或缺少成本價信息時，不進行加倉/對沖處理
+        if net == 0.0 or not avg_entry or direction not in ("LONG", "SHORT"):
             return
 
         current_size = abs(net)
-        if max_position <= 0.0:
-            return
+        max_position = float(getattr(self, "max_position", 0.0) or 0.0)
+        scale_in_enabled = (
+            getattr(self, "scale_in_price_step_pct", 0.0) > 0.0 
+            and getattr(self, "scale_in_size_pct", 0.0) > 0.0
+        )
+        step_ratio = self.scale_in_price_step_pct / 100.0 if scale_in_enabled else 0.0
 
-        # 核心修复：放宽首笔触发条件
-        # 旧逻辑要求 abs(prev_net) < min_qty，但可能因为并发使得 prev_net 更新不及时或被置为0
-        # 新逻辑：只要当前有持仓，且未部署加仓梯队，就尝试部署
+        # 情況 2: 首次產生倉位 -> 取消另一側初始訂單，掛對沖單，掛加倉梯隊
         is_first_entry = (abs(prev_net) < min_qty and current_size >= min_qty)
-        missing_ladder = (current_size >= min_qty and not self._scale_ladder_deployed)
+        missing_ladder = (current_size >= min_qty and not self._scale_ladder_deployed and scale_in_enabled)
 
         if is_first_entry or missing_ladder:
             logger.info(
-                "触发加仓检查: 首笔=%s, 缺梯队=%s (当前仓位=%s, 上次仓位=%s)",
+                "触发首次建仓/加仓检查: 首笔=%s, 缺梯队=%s (当前仓位=%s, 上次仓位=%s)",
                 is_first_entry,
                 missing_ladder,
                 format_balance(current_size),
                 format_balance(prev_net),
             )
+            
+            # 取消另一侧的初始订单
+            if not self._initial_orders_cancelled:
+                self._cancel_initial_orders()
+            
+            # 挂对冲单（在成本价平仓）
+            hedge_side = "Ask" if direction == "LONG" else "Bid"
+            exit_price = self._determine_exit_price(position_state, avg_entry)
+            hedge_price = round_to_tick_size(exit_price, self.tick_size)
+            hedge_qty = round_to_precision(current_size, self.base_precision)
+            
+            if hedge_qty >= min_qty:
+                self._cancel_close_order()
+                logger.info(
+                    "首次建仓后挂对冲单: 方向=%s, 价格=%.8f, 数量=%s",
+                    hedge_side,
+                    hedge_price,
+                    format_balance(hedge_qty),
+                )
+                self._place_post_only_perp_order(
+                    side=hedge_side,
+                    quantity=hedge_qty,
+                    price=hedge_price,
+                    reduce_only=True,
+                )
+            
+            # 如果配置了加仓参数，挂加仓梯队
             self._scale_in_last_ref_price = avg_entry
-            if not self._scale_ladder_deployed:
+            if scale_in_enabled and max_position > 0.0 and not self._scale_ladder_deployed:
                 deployed = self._place_scale_in_ladder(
                     direction=direction,
                     base_price=avg_entry,
