@@ -191,28 +191,26 @@ class PureMakerStrategy(PerpetualMarketMaker):
         logger.info("📝 准备挂单: 买单 %.8f x %s | 卖单 %.8f x %s",
                     buy_price, format_balance(qty), sell_price, format_balance(qty))
         
-        # 挂买单（入场单A - 可能形成多头）
-        buy_order = self._place_post_only_order(
-            side="Bid",
-            price=buy_price,
-            quantity=qty,
-            role=OrderRole.ENTRY_BID,
-        )
-        if not buy_order:
-            logger.error("❌ 买单挂单失败，取消本轮")
-            self._cancel_all_tracked_orders()
-            self._schedule_next_round()
-            return
+        # 优先使用批量下单
+        orders = [
+            {
+                "side": "Bid",
+                "price": buy_price,
+                "quantity": qty,
+                "role": OrderRole.ENTRY_BID,
+            },
+            {
+                "side": "Ask",
+                "price": sell_price,
+                "quantity": qty,
+                "role": OrderRole.ENTRY_ASK,
+            },
+        ]
         
-        # 挂卖单（入场单A - 可能形成空头）
-        sell_order = self._place_post_only_order(
-            side="Ask",
-            price=sell_price,
-            quantity=qty,
-            role=OrderRole.ENTRY_ASK,
-        )
-        if not sell_order:
-            logger.error("❌ 卖单挂单失败，取消本轮")
+        placed_orders = self._place_orders_batch(orders, post_only=True, reduce_only=False)
+        
+        if len(placed_orders) < 2:
+            logger.error("❌ 入场挂单不完整（成功 %d/2），取消本轮", len(placed_orders))
             self._cancel_all_tracked_orders()
             self._schedule_next_round()
             return
@@ -257,11 +255,12 @@ class PureMakerStrategy(PerpetualMarketMaker):
         quantity: float,
         role: OrderRole,
         reduce_only: bool = False,
-        max_retries: int = 10,
+        max_retries: int = 3,
     ) -> Optional[TrackedOrder]:
-        """下 Post-Only 限价单，自动处理价格调整"""
+        """下 Post-Only 限价单，遇到立即成交错误时改用普通限价单"""
         
         current_price = price
+        use_post_only = True
         
         for attempt in range(max_retries):
             with self._order_lock:
@@ -271,7 +270,7 @@ class PureMakerStrategy(PerpetualMarketMaker):
                     price=current_price,
                     order_type="Limit",
                     reduce_only=reduce_only,
-                    post_only=True,
+                    post_only=use_post_only,
                 )
             
             if isinstance(result, dict) and "error" in result:
@@ -279,18 +278,15 @@ class PureMakerStrategy(PerpetualMarketMaker):
                 
                 # 检查是否是 Post-Only 立即成交的错误
                 if "immediately match" in error_msg or "post-only" in error_msg or "would be taker" in error_msg:
-                    # 调整价格远离盘口
-                    if side == "Bid":
-                        current_price = round_to_tick_size(current_price - self.tick_size, self.tick_size)
+                    if use_post_only:
+                        # 第一次遇到错误：改用普通限价单（可能会立即成交）
+                        logger.warning("⚡ Post-Only 被拒，改用普通限价单（可能立即成交）")
+                        use_post_only = False
+                        continue
                     else:
-                        current_price = round_to_tick_size(current_price + self.tick_size, self.tick_size)
-                    
-                    if current_price <= 0:
-                        logger.error("价格调整后<=0，无法下单")
+                        # 普通限价单也失败了
+                        logger.error("普通限价单也失败: %s", result.get("error"))
                         return None
-                    
-                    logger.warning("Post-Only 被拒（第 %d 次），调整价格至 %.8f", attempt + 1, current_price)
-                    continue
                 else:
                     logger.error("下单失败: %s", result.get("error"))
                     return None
@@ -319,13 +315,125 @@ class PureMakerStrategy(PerpetualMarketMaker):
                 OrderRole.SCALE_IN: "加仓单",
             }.get(role, str(role))
             
-            logger.info("📤 %s已挂出: ID=%s, 方向=%s, 价格=%.8f, 数量=%s",
-                        role_name, order_id, side, current_price, format_balance(quantity))
+            # 标记是否使用了非 Post-Only
+            mode_info = "" if use_post_only else " (非PostOnly)"
+            logger.info("📤 %s已挂出%s: ID=%s, 方向=%s, 价格=%.8f, 数量=%s",
+                        role_name, mode_info, order_id, side, current_price, format_balance(quantity))
             
             return tracked
         
         logger.error("达到最大重试次数，无法下单")
         return None
+
+    def _place_orders_batch(
+        self,
+        orders: List[Dict[str, Any]],
+        post_only: bool = True,
+        reduce_only: bool = False,
+    ) -> List[TrackedOrder]:
+        """批量下单，失败时回退到逐笔下单"""
+        placed_orders: List[TrackedOrder] = []
+        
+        # 构建批量订单请求
+        batch_orders = []
+        for order_info in orders:
+            order_payload = {
+                "symbol": self.symbol,
+                "side": order_info["side"],
+                "quantity": str(order_info["quantity"]),
+                "price": str(order_info["price"]),
+                "orderType": "Limit",
+                "postOnly": post_only,
+                "reduceOnly": reduce_only,
+                "timeInForce": "GTC",
+            }
+            batch_orders.append(order_payload)
+        
+        logger.info("📦 尝试批量下单: %d 个订单", len(batch_orders))
+        
+        # 尝试批量下单
+        batch_success = False
+        try:
+            result = self.client.execute_order_batch(batch_orders)
+            
+            if isinstance(result, list):
+                # 批量下单成功，处理返回结果
+                for i, order_result in enumerate(result):
+                    if isinstance(order_result, dict):
+                        if "error" in order_result:
+                            error_msg = str(order_result.get("error", "")).lower()
+                            # 检查是否是 Post-Only 错误
+                            if "immediately match" in error_msg or "post-only" in error_msg or "would be taker" in error_msg:
+                                logger.warning("⚡ 批量下单中第 %d 个订单 Post-Only 被拒", i + 1)
+                            else:
+                                logger.warning("批量下单中第 %d 个订单失败: %s", i + 1, order_result.get("error"))
+                            continue
+                        
+                        order_id = order_result.get("id") or order_result.get("orderId")
+                        if order_id and i < len(orders):
+                            order_info = orders[i]
+                            tracked = TrackedOrder(
+                                order_id=str(order_id),
+                                role=order_info["role"],
+                                side=order_info["side"],
+                                price=float(order_info["price"]),
+                                quantity=float(order_info["quantity"]),
+                            )
+                            with self._state_lock:
+                                self._tracked_orders[tracked.order_id] = tracked
+                            placed_orders.append(tracked)
+                            
+                            role_name = {
+                                OrderRole.ENTRY_BID: "入场买单",
+                                OrderRole.ENTRY_ASK: "入场卖单",
+                                OrderRole.HEDGE: "对冲单",
+                                OrderRole.SCALE_IN: "加仓单",
+                            }.get(order_info["role"], str(order_info["role"]))
+                            logger.info("📤 %s已挂出: ID=%s, 方向=%s, 价格=%.8f, 数量=%s",
+                                        role_name, order_id, order_info["side"], 
+                                        order_info["price"], format_balance(order_info["quantity"]))
+                
+                if placed_orders:
+                    batch_success = True
+                    logger.info("✅ 批量下单完成: %d/%d 成功", len(placed_orders), len(orders))
+            elif isinstance(result, dict) and "error" in result:
+                logger.warning("批量下单失败: %s，回退到逐笔下单", result.get("error"))
+            else:
+                logger.warning("批量下单返回未知格式，回退到逐笔下单")
+        except Exception as e:
+            logger.warning("批量下单异常: %s，回退到逐笔下单", e)
+        
+        # 如果批量下单完全失败，回退到逐笔下单
+        if not batch_success:
+            logger.info("📝 回退到逐笔下单模式")
+            for order_info in orders:
+                order = self._place_post_only_order(
+                    side=order_info["side"],
+                    price=order_info["price"],
+                    quantity=order_info["quantity"],
+                    role=order_info["role"],
+                    reduce_only=reduce_only,
+                )
+                if order:
+                    placed_orders.append(order)
+        
+        # 对于批量下单失败的订单，逐笔补单
+        elif len(placed_orders) < len(orders):
+            placed_sides = {o.side for o in placed_orders}
+            for order_info in orders:
+                if order_info["side"] not in placed_sides:
+                    logger.info("📝 补下单: %s", order_info["side"])
+                    order = self._place_post_only_order(
+                        side=order_info["side"],
+                        price=order_info["price"],
+                        quantity=order_info["quantity"],
+                        role=order_info["role"],
+                        reduce_only=reduce_only,
+                    )
+                    if order:
+                        placed_orders.append(order)
+        
+        return placed_orders
 
     def _update_hedge_order_price(self, new_price: float) -> bool:
         """更新对冲单的价格（取消旧单+下新单）"""
@@ -391,10 +499,30 @@ class PureMakerStrategy(PerpetualMarketMaker):
             return False
 
     def _cancel_all_tracked_orders(self) -> None:
-        """取消所有追踪的订单"""
+        """取消所有追踪的订单（优先使用批量取消）"""
         with self._state_lock:
-            order_ids = list(self._tracked_orders.keys())
+            order_ids = [oid for oid, order in self._tracked_orders.items() if order.is_active]
         
+        if not order_ids:
+            return
+        
+        # 优先尝试批量取消
+        try:
+            logger.info("📦 尝试批量取消 %d 个订单", len(order_ids))
+            result = self.client.cancel_all_orders(self.symbol)
+            if isinstance(result, dict) and "error" not in result:
+                logger.info("✅ 批量取消订单成功")
+                with self._state_lock:
+                    for oid in order_ids:
+                        if oid in self._tracked_orders:
+                            self._tracked_orders[oid].is_active = False
+                return
+            else:
+                logger.warning("批量取消订单失败: %s，回退到逐笔取消", result.get("error") if isinstance(result, dict) else result)
+        except Exception as e:
+            logger.warning("批量取消订单异常: %s，回退到逐笔取消", e)
+        
+        # 回退到逐笔取消
         for order_id in order_ids:
             self._cancel_order_by_id(order_id)
 
@@ -417,7 +545,7 @@ class PureMakerStrategy(PerpetualMarketMaker):
     # ============================================================
     
     def _place_scale_in_orders(self, direction: str, entry_price: float, current_position: float) -> None:
-        """挂加仓订单梯队"""
+        """挂加仓订单梯队（优先使用批量下单）"""
         if self.scale_in_price_step_pct <= 0 or self.scale_in_size_pct <= 0:
             logger.debug("未配置加仓参数，跳过加仓单")
             return
@@ -434,7 +562,8 @@ class PureMakerStrategy(PerpetualMarketMaker):
         level = 0
         base_price = entry_price
         
-        scale_in_orders = []
+        # 先计算所有加仓订单的参数
+        pending_orders = []
         
         while current_size < self.max_position - self.min_order_size / 2:
             level += 1
@@ -462,27 +591,35 @@ class PureMakerStrategy(PerpetualMarketMaker):
                 logger.debug("加仓数量 %s 低于最小单位，停止加仓", format_balance(add_qty))
                 break
             
-            # 下加仓单
-            order = self._place_post_only_order(
-                side=scale_side,
-                price=scale_price,
-                quantity=add_qty,
-                role=OrderRole.SCALE_IN,
-                reduce_only=False,
-            )
+            pending_orders.append({
+                "side": scale_side,
+                "price": scale_price,
+                "quantity": add_qty,
+                "role": OrderRole.SCALE_IN,
+                "level": level,
+            })
             
-            if order:
-                scale_in_orders.append(order)
-                current_size += add_qty
-                remaining_capacity -= add_qty
-                logger.info("📈 加仓单 #%d: 价格=%.8f, 数量=%s", level, scale_price, format_balance(add_qty))
-            else:
-                logger.warning("加仓单 #%d 挂单失败", level)
-                break
+            current_size += add_qty
+            remaining_capacity -= add_qty
             
             # 防止无限循环
             if level >= 20:
                 break
+        
+        if not pending_orders:
+            logger.info("无需挂加仓单")
+            return
+        
+        # 使用批量下单
+        logger.info("📈 准备挂 %d 个加仓单", len(pending_orders))
+        scale_in_orders = self._place_orders_batch(pending_orders, post_only=True, reduce_only=False)
+        
+        for order in scale_in_orders:
+            # 找到对应的 pending_order 获取 level
+            for po in pending_orders:
+                if abs(po["price"] - order.price) < self.tick_size / 2 and po["side"] == order.side:
+                    logger.info("📈 加仓单 #%d: 价格=%.8f, 数量=%s", po["level"], order.price, format_balance(order.quantity))
+                    break
         
         with self._state_lock:
             self._round_state.scale_in_orders = scale_in_orders
@@ -596,6 +733,22 @@ class PureMakerStrategy(PerpetualMarketMaker):
         """入场单成交处理"""
         logger.info("🎯 入场单成交！方向=%s, 仓位=%s", direction, format_balance(net))
         
+        # 检查：如果仓位为 0（可能是立即成交后又被平仓，或 API 返回延迟），直接进入下一轮
+        tolerance = self.min_order_size / 10
+        if abs(net) <= tolerance or direction == "FLAT":
+            logger.info("⚡ 仓位已为 0（可能立即成交后被平仓），本轮完成")
+            logger.info("📊 累计刷量: %.2f %s", self._total_volume, self.quote_asset)
+            
+            with self._state_lock:
+                self._round_state.is_completed = True
+            
+            # 取消所有剩余订单
+            self._cancel_all_tracked_orders()
+            
+            # 调度下一轮
+            self._schedule_next_round()
+            return
+        
         with self._state_lock:
             # 记录入场订单
             self._round_state.entry_order = order
@@ -690,13 +843,36 @@ class PureMakerStrategy(PerpetualMarketMaker):
             logger.info("   └─ 仓位未完全归零 (剩余 %.8f)，等待继续平仓", net)
 
     def _cancel_remaining_scale_in_orders(self) -> None:
-        """取消剩余的加仓单"""
+        """取消剩余的加仓单（优先使用批量取消）"""
         with self._state_lock:
-            scale_in_orders = self._round_state.scale_in_orders
+            orders_to_cancel = [
+                order for order in self._round_state.scale_in_orders 
+                if order.is_active and not order.is_fully_filled
+            ]
         
-        for order in scale_in_orders:
-            if order.is_active and not order.is_fully_filled:
-                self._cancel_order_by_id(order.order_id)
+        if not orders_to_cancel:
+            return
+        
+        order_ids = [o.order_id for o in orders_to_cancel]
+        
+        # 如果有多个订单，尝试批量取消
+        if len(order_ids) > 1:
+            try:
+                logger.info("📦 尝试批量取消 %d 个加仓单", len(order_ids))
+                result = self.client.cancel_all_orders(self.symbol)
+                if isinstance(result, dict) and "error" not in result:
+                    logger.info("✅ 批量取消加仓单成功")
+                    with self._state_lock:
+                        for oid in order_ids:
+                            if oid in self._tracked_orders:
+                                self._tracked_orders[oid].is_active = False
+                    return
+            except Exception as e:
+                logger.warning("批量取消加仓单异常: %s，回退到逐笔取消", e)
+        
+        # 逐笔取消
+        for order_id in order_ids:
+            self._cancel_order_by_id(order_id)
 
     # ============================================================
     # 辅助方法
