@@ -1,1249 +1,802 @@
-"""纯 Maker-Maker 策略：仅挂买一/卖一，双向成交后继续循环。"""
+"""纯 Maker-Maker 刷交易量策略
+
+逻辑流程：
+1. 在买一/卖一挂 Post-Only 订单（订单A和订单B）
+2. 当订单A成交后，更新反向订单B的价格为当前仓位的 breakEvenPrice
+3. 挂加仓订单，由 scale_in_price_step_pct 和 scale_in_size_pct 控制，最大不超过 max_position
+4. 每当加仓订单成交后，更新反向订单B的价格为当前仓位的 breakEvenPrice
+5. 当反向订单B成交后，仓位归0，等待3秒，进入下一轮
+"""
 from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Set
 
 from logger import setup_logger
-from strategies.market_maker import MarketMaker, format_balance
 from strategies.perp_market_maker import PerpetualMarketMaker
+from strategies.market_maker import format_balance
 from utils.helpers import round_to_precision, round_to_tick_size
 
 logger = setup_logger("pure_maker_strategy")
 
 
-class _PureMakerMixin:
-    """纯 Maker 策略核心实现：仅在买一/卖一挂单，双向成交后继续。"""
+class OrderRole(Enum):
+    """订单角色"""
+    ENTRY_BID = "entry_bid"      # 入场买单（订单A，多方向）
+    ENTRY_ASK = "entry_ask"      # 入场卖单（订单A，空方向）
+    HEDGE = "hedge"              # 对冲/平仓单（订单B）
+    SCALE_IN = "scale_in"        # 加仓单
+
+
+@dataclass
+class TrackedOrder:
+    """追踪的订单信息"""
+    order_id: str
+    role: OrderRole
+    side: str           # "Bid" 或 "Ask"
+    price: float
+    quantity: float
+    filled_qty: float = 0.0
+    is_active: bool = True
+    
+    @property
+    def remaining_qty(self) -> float:
+        return max(0.0, self.quantity - self.filled_qty)
+    
+    @property
+    def is_fully_filled(self) -> bool:
+        return self.filled_qty >= self.quantity - 1e-10
+
+
+@dataclass
+class RoundState:
+    """一轮交易的状态"""
+    round_id: int = 0
+    entry_order: Optional[TrackedOrder] = None     # 入场订单A
+    hedge_order: Optional[TrackedOrder] = None     # 对冲订单B
+    scale_in_orders: List[TrackedOrder] = field(default_factory=list)  # 加仓订单列表
+    position_direction: Optional[str] = None       # "LONG" 或 "SHORT"
+    is_completed: bool = False
+
+
+class PureMakerStrategy(PerpetualMarketMaker):
+    """纯 Maker-Maker 刷交易量策略
+    
+    继承自 PerpetualMarketMaker，复用其仓位管理和订单执行能力。
+    """
 
     def __init__(
         self,
-        *args: Any,
-        strategy_label: str = "纯Maker",
-        scale_in_price_step_pct: float = 0.0,
-        scale_in_size_pct: float = 0.0,
-        close_price_mode: str = "entry",
+        api_key: str,
+        secret_key: str,
+        symbol: str,
+        order_quantity: Optional[float] = None,
+        max_position: float = 1.0,
+        scale_in_price_step_pct: float = 1.0,
+        scale_in_size_pct: float = 50.0,
         next_round_delay_seconds: float = 3.0,
+        exchange: str = "backpack",
+        exchange_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        # 强制单层订单，禁用重平衡
-        kwargs.pop("max_orders", None)
-        kwargs.pop("enable_rebalance", None)
-        kwargs.pop("base_asset_target_percentage", None)
-        kwargs.pop("rebalance_threshold", None)
-
-        kwargs["max_orders"] = 1
-        kwargs["enable_rebalance"] = False
-
-        self._strategy_label = strategy_label
-
-        # 加仓配置（仅在永续合约策略中生效）
-        self.scale_in_price_step_pct = max(0.0, float(scale_in_price_step_pct or 0.0))
-        self.scale_in_size_pct = max(0.0, float(scale_in_size_pct or 0.0))
-        self._scale_in_last_ref_price = 0.0
-        self._scale_in_last_net = 0.0
-        close_mode = str(close_price_mode or "entry").lower()
-        if close_mode not in {"entry", "break_even"}:
-            close_mode = "entry"
-        self.close_price_mode = close_mode
-        self._next_round_delay = max(0.0, float(next_round_delay_seconds or 0.0))
-        self._next_round_scheduled = False
-        self._next_round_lock = threading.Lock()  # 保护 _next_round_scheduled 的线程锁
-        self._next_round_thread: Optional[threading.Thread] = None
-        self._restart_on_flat = False
-        self._max_post_only_adjustments = 50
-        self._initial_orders_cancelled = False
-        self._current_close_order_id: Optional[str] = None
-        self._scale_ladder_deployed = False
-        
-        # 成交追踪
-        self._bid_filled = False
-        self._ask_filled = False
-        self._round_count = 0
-        self._total_profit_quote = 0.0  # 累计利润（报价资产）
-        self._processed_fill_ids: set = set()  # 用于成交事件去重
-        
-        # 请求限流
-        self._request_intervals: Dict[str, float] = {
-            "limit": 0.35,
-        }
-        self._last_request_ts: Dict[str, float] = {key: 0.0 for key in self._request_intervals}
-
-        super().__init__(*args, **kwargs)
-
-        self.max_orders = 1
-        # 当前一轮挂单的目标数量与成交进度
-        self._current_buy_order_qty = 0.0
-        self._current_sell_order_qty = 0.0
-        self._buy_filled_qty = 0.0
-        self._sell_filled_qty = 0.0
-        # 完全成交的容忍误差（防止精度问题）
-        self._fill_tolerance = max(getattr(self, "min_order_size", 0.0) / 1000, 1e-8)
-
-        logger.info("初始化纯 Maker-Maker 策略 (%s)", self._strategy_label)
-    # ------------------------------------------------------------------
-    # 挂单逻辑
-    # ------------------------------------------------------------------
-    def place_limit_orders(self) -> None:
-        """仅在买一/卖一位置挂出 Post-Only 订单。
-
-        逻辑：
-        - 若当前一轮买/卖单尚未全部成交：不取消、不重下，继续等待成交
-        - 仅在上一轮双向完全成交后，才取消残余订单并挂出下一轮
         """
+        初始化策略
+        
+        Args:
+            order_quantity: 每轮入场订单的数量
+            max_position: 最大持仓量
+            scale_in_price_step_pct: 加仓价格步长百分比（如 1.0 表示每下跌/上涨 1% 加一次仓）
+            scale_in_size_pct: 加仓数量百分比（如 50.0 表示每次加仓数量为当前仓位的 50%）
+            next_round_delay_seconds: 一轮结束后等待多少秒开始下一轮
+        """
+        # 禁用父类的重平衡和库存偏移
+        kwargs["enable_rebalance"] = False
+        kwargs["inventory_skew"] = 0.0
+        kwargs["target_position"] = 0.0
+        kwargs["base_spread_percentage"] = 0.0
+        
+        super().__init__(
+            api_key=api_key,
+            secret_key=secret_key,
+            symbol=symbol,
+            max_position=max_position,
+            exchange=exchange,
+            exchange_config=exchange_config,
+            order_quantity=order_quantity,
+            **kwargs,
+        )
+        
+        # 策略参数
+        self.order_quantity = order_quantity
+        self.scale_in_price_step_pct = max(0.0, float(scale_in_price_step_pct))
+        self.scale_in_size_pct = max(0.0, float(scale_in_size_pct))
+        self.next_round_delay = max(0.0, float(next_round_delay_seconds))
+        
+        # 状态追踪
+        self._round_state = RoundState()
+        self._round_count = 0
+        self._total_volume = 0.0
+        
+        # 线程安全锁
+        self._state_lock = threading.RLock()
+        self._order_lock = threading.Lock()
+        
+        # 成交事件去重
+        self._processed_fill_ids: Set[str] = set()
+        self._recent_fill_ids: deque = deque(maxlen=1000)
+        
+        # 订单追踪表 order_id -> TrackedOrder
+        self._tracked_orders: Dict[str, TrackedOrder] = {}
+        
+        # 控制标志
+        self._stop_flag = False
+        self._next_round_scheduled = False
+        self._next_round_lock = threading.Lock()
+        
+        logger.info("=" * 60)
+        logger.info("初始化纯 Maker-Maker 刷量策略")
+        logger.info("  交易对: %s", symbol)
+        logger.info("  单笔数量: %s", format_balance(order_quantity) if order_quantity else "自动计算")
+        logger.info("  最大仓位: %s", format_balance(max_position))
+        logger.info("  加仓价格步长: %.2f%%", scale_in_price_step_pct)
+        logger.info("  加仓数量比例: %.2f%%", scale_in_size_pct)
+        logger.info("  轮次间隔: %.1f 秒", next_round_delay_seconds)
+        logger.info("=" * 60)
 
-        self.check_ws_connection()
-
-        # 如果已有一轮挂单在进行，优先检查是否全部成交
-        if self._current_buy_order_qty > 0.0 or self._current_sell_order_qty > 0.0:
-            buy_done = (
-                self._current_buy_order_qty <= 0.0
-                or self._buy_filled_qty + self._fill_tolerance >= self._current_buy_order_qty
-            )
-            sell_done = (
-                self._current_sell_order_qty <= 0.0
-                or self._sell_filled_qty + self._fill_tolerance >= self._current_sell_order_qty
-            )
-
-            if not (buy_done and sell_done):
-                logger.debug(
-                    "当前一轮挂单尚未全部成交，保持原有挂单不变（买已完成=%s, 卖已完成=%s）",
-                    buy_done,
-                    sell_done,
-                )
-                return
-
-            # 当前一轮已全部成交，可以开始新一轮
+    # ============================================================
+    # 核心流程控制
+    # ============================================================
+    
+    def _start_new_round(self) -> None:
+        """开始新一轮交易"""
+        with self._state_lock:
             self._round_count += 1
-            logger.info(
-                "✅ 第 %d 轮双向完全成交，累计估算利润约 %.8f %s，准备挂出新一轮",
-                self._round_count,
-                self._total_profit_quote,
-                self.quote_asset,
-            )
-            # 重置进度，准备新一轮
-            self._bid_filled = False
-            self._ask_filled = False
-            self._current_buy_order_qty = 0.0
-            self._current_sell_order_qty = 0.0
-            self._buy_filled_qty = 0.0
-            self._sell_filled_qty = 0.0
-
-        # 只有在上一轮结束（或首轮）时才会走到这里：可以取消旧订单并挂出新一轮
-        self.cancel_existing_orders()
-
+            self._round_state = RoundState(round_id=self._round_count)
+            self._tracked_orders.clear()
+        
+        logger.info("")
+        logger.info("=" * 50)
+        logger.info("🚀 开始第 %d 轮交易", self._round_count)
+        logger.info("=" * 50)
+        
+        # 获取买一/卖一价格
         bid_price, ask_price = self.get_market_depth()
         if bid_price is None or ask_price is None:
-            logger.warning("无法获取买一/卖一价格，跳过本轮挂单")
+            logger.error("❌ 无法获取买一/卖一价格，跳过本轮")
+            self._schedule_next_round()
             return
-
+        
+        logger.info("📊 当前盘口: 买一 %.8f | 卖一 %.8f | 价差 %.4f%%", 
+                    bid_price, ask_price, (ask_price - bid_price) / bid_price * 100)
+        
+        # 计算订单数量
+        qty = self._calculate_order_quantity(bid_price)
+        if qty is None or qty < self.min_order_size:
+            logger.error("❌ 订单数量计算失败或过小，跳过本轮")
+            self._schedule_next_round()
+            return
+        
+        # 在买一和卖一挂单
         buy_price = round_to_tick_size(bid_price, self.tick_size)
         sell_price = round_to_tick_size(ask_price, self.tick_size)
-
+        
         # 确保价差足够
         if sell_price <= buy_price:
             sell_price = round_to_tick_size(buy_price + self.tick_size, self.tick_size)
-            if sell_price <= buy_price:
-                logger.warning("价差过窄无法安全挂单，跳过本轮")
-                return
-
-        buy_qty, sell_qty = self._determine_order_sizes(buy_price, sell_price)
-        if buy_qty is None or sell_qty is None:
-            logger.warning("无法计算挂单数量，跳过本轮")
-            return
-
-        # 记录本轮目标数量与进度
-        self._current_buy_order_qty = buy_qty
-        self._current_sell_order_qty = sell_qty
-        self._buy_filled_qty = 0.0
-        self._sell_filled_qty = 0.0
-        self._bid_filled = False
-        self._ask_filled = False
-
-        self.active_buy_orders = []
-        self.active_sell_orders = []
-        self._initial_order_ids: Dict[str, str] = {}
-
-        # 只挂未成交的方向（首轮两侧都会挂出）
-        if buy_qty >= self.min_order_size:
-            buy_order = self._build_limit_order(
-                side="Bid",
-                price=buy_price,
-                quantity=buy_qty,
-            )
-            result = self._submit_order(buy_order, slot="limit")
-            if isinstance(result, dict) and "error" in result:
-                logger.error(f"买单挂单失败: {result['error']}")
-                # 若下单失败，则清空本轮买单目标，避免无限等待
-                self._current_buy_order_qty = 0.0
-                self._handle_order_submission_failure("Bid", result)
-                return
-            else:
-                logger.info(
-                    "🟢 买单已挂出: 价格 %s, 数量 %s",
-                    format_balance(buy_price),
-                    format_balance(buy_qty),
-                )
-                self.active_buy_orders.append(result)
-                if isinstance(result, dict):
-                    order_id = result.get("id")
-                    if order_id:
-                        self._initial_order_ids["Bid"] = str(order_id)
-                self.orders_placed += 1
-
-        if sell_qty >= self.min_order_size:
-            sell_order = self._build_limit_order(
-                side="Ask",
-                price=sell_price,
-                quantity=sell_qty,
-            )
-            result = self._submit_order(sell_order, slot="limit")
-            if isinstance(result, dict) and "error" in result:
-                logger.error(f"卖单挂单失败: {result['error']}")
-                # 若下单失败，则清空本轮卖单目标，避免无限等待
-                self._current_sell_order_qty = 0.0
-                self._handle_order_submission_failure("Ask", result)
-                return
-            else:
-                logger.info(
-                    "🔴 卖单已挂出: 价格 %s, 数量 %s",
-                    format_balance(sell_price),
-                    format_balance(sell_qty),
-                )
-                self.active_sell_orders.append(result)
-                if isinstance(result, dict):
-                    order_id = result.get("id")
-                    if order_id:
-                        self._initial_order_ids["Ask"] = str(order_id)
-                self.orders_placed += 1
-
-    def _determine_order_sizes(self, buy_price: float, sell_price: float) -> Tuple[Optional[float], Optional[float]]:
-        """根据余额决定单笔买/卖单量。"""
-
-        if self.order_quantity is not None:
-            quantity = max(
-                self.min_order_size,
-                round_to_precision(self.order_quantity, self.base_precision),
-            )
-            return quantity, quantity
-
-        base_available, base_total = self.get_asset_balance(self.base_asset)
-        quote_available, quote_total = self.get_asset_balance(self.quote_asset)
-
-        reference_price = sell_price if sell_price else buy_price
-        if reference_price <= 0:
-            return None, None
-
-        # 使用总资金的 10% 作为单笔订单规模
-        allocation = 0.1
-        quote_budget = quote_total * allocation
-        base_budget = base_total * allocation
-
-        if quote_budget <= 0 or base_budget <= 0:
-            logger.warning("余额不足，无法挂出 Maker 订单")
-            return None, None
-
-        buy_qty = round_to_precision(quote_budget / reference_price, self.base_precision)
-        sell_qty = round_to_precision(base_budget, self.base_precision)
-
-        buy_qty = max(self.min_order_size, buy_qty)
-        sell_qty = max(self.min_order_size, sell_qty)
-
-        if quote_available < buy_qty * reference_price:
-            logger.info(
-                "可用报价资产不足 (%.8f)，将依赖自动赎回",
-                quote_available,
-            )
-        if base_available < sell_qty:
-            logger.info(
-                "可用基础资产不足 (%.8f)，将依赖自动赎回",
-                base_available,
-            )
-
-        return buy_qty, sell_qty
-
-    # ------------------------------------------------------------------
-    # 轮次控制
-    # ------------------------------------------------------------------
-    def _is_position_flat(self) -> bool:
-        if hasattr(self, "get_position_state"):
-            try:
-                position_state = self.get_position_state()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("檢查倉位時出錯，暫不啟動下一輪: %s", exc)
-                return False
-            net = float(position_state.get("net", 0.0) or 0.0)
-            tolerance = max(self._fill_tolerance, getattr(self, "min_order_size", 0.0) / 10)
-            return abs(net) <= tolerance
-        return True
-
-    def _schedule_next_round(self) -> None:
-        if getattr(self, "_stop_flag", False):
+        
+        logger.info("📝 准备挂单: 买单 %.8f x %s | 卖单 %.8f x %s",
+                    buy_price, format_balance(qty), sell_price, format_balance(qty))
+        
+        # 挂买单（入场单A - 可能形成多头）
+        buy_order = self._place_post_only_order(
+            side="Bid",
+            price=buy_price,
+            quantity=qty,
+            role=OrderRole.ENTRY_BID,
+        )
+        if not buy_order:
+            logger.error("❌ 买单挂单失败，取消本轮")
+            self._cancel_all_tracked_orders()
+            self._schedule_next_round()
             return
         
-        # 使用线程锁保护，避免竞态条件
+        # 挂卖单（入场单A - 可能形成空头）
+        sell_order = self._place_post_only_order(
+            side="Ask",
+            price=sell_price,
+            quantity=qty,
+            role=OrderRole.ENTRY_ASK,
+        )
+        if not sell_order:
+            logger.error("❌ 卖单挂单失败，取消本轮")
+            self._cancel_all_tracked_orders()
+            self._schedule_next_round()
+            return
+        
+        logger.info("✅ 第 %d 轮挂单完成，等待成交...", self._round_count)
+
+    def _schedule_next_round(self) -> None:
+        """调度下一轮交易"""
+        if self._stop_flag:
+            return
+        
         with self._next_round_lock:
             if self._next_round_scheduled:
+                logger.debug("下一轮已在调度中，跳过")
                 return
             self._next_round_scheduled = True
-
-        def _fire() -> None:
+        
+        def _delayed_start():
             try:
-                if self._next_round_delay > 0:
-                    logger.info("倉位已平，%.1f 秒後啟動下一輪掛單", self._next_round_delay)
-                    time.sleep(self._next_round_delay)
-                else:
-                    logger.info("倉位已平，立即啟動下一輪掛單")
-                self.place_limit_orders()
-            except Exception as exc:  # noqa: BLE001
-                logger.error("啟動下一輪掛單時出錯: %s", exc)
+                if self.next_round_delay > 0:
+                    logger.info("⏳ 等待 %.1f 秒后开始下一轮...", self.next_round_delay)
+                    time.sleep(self.next_round_delay)
+                
+                if not self._stop_flag:
+                    self._start_new_round()
+            except Exception as e:
+                logger.error("启动下一轮时出错: %s", e)
             finally:
                 with self._next_round_lock:
                     self._next_round_scheduled = False
-
-        self._next_round_thread = threading.Thread(target=_fire, daemon=True)
-        self._next_round_thread.start()
-
-    def _maybe_trigger_next_round(self) -> None:
-        """检查本轮是否结束，若结束则启动下一轮（或等待平仓）。"""
-        # 1. 检查挂单是否全部成交
-        buy_done = (
-            self._current_buy_order_qty <= 0.0
-            or self._buy_filled_qty + self._fill_tolerance >= self._current_buy_order_qty
-        )
-        sell_done = (
-            self._current_sell_order_qty <= 0.0
-            or self._sell_filled_qty + self._fill_tolerance >= self._current_sell_order_qty
-        )
-
-        if not (buy_done and sell_done):
-            # 本轮挂单还没跑完，不进行下一轮
-            return
-
-        logger.info("✅ 本轮双向挂单已全部成交，检查仓位状态准备进入下一轮...")
         
-        # 2. 如果是现货或永续且仓位已平，直接下一轮
-        if self._is_position_flat():
-            logger.info("仓位已平 (Flat)，启动下一轮倒计时")
-            self._schedule_next_round()
-        else:
-            # 3. 永续有仓位：
-            #    此时意味着本轮虽然挂单结束，但可能触发了加仓/对冲逻辑（或者还未平仓）
-            #    如果进入了加仓模式，则由加仓/平仓逻辑接管，不再自动启动下一轮 Maker 循环
-            #    直到仓位归零 (在 _handle_perp_scale_and_hedge 中检测到 net=0)
-            logger.info("仓位未平 (Net != 0)，暂不启动新一轮 Maker 循环，等待平仓/加仓逻辑接管")
+        threading.Thread(target=_delayed_start, daemon=True).start()
 
-    def _determine_exit_price(self, position_state: Optional[Dict[str, Any]], fallback: float) -> float:
-        if self.close_price_mode != "break_even" or not position_state:
-            return fallback
-        for key in ("break_even_price", "breakEvenPrice", "breakevenPrice"):
-            price = position_state.get(key)
-            if price:
-                try:
-                    price_val = float(price)
-                except (TypeError, ValueError):
+    # ============================================================
+    # 订单管理
+    # ============================================================
+    
+    def _place_post_only_order(
+        self,
+        side: str,
+        price: float,
+        quantity: float,
+        role: OrderRole,
+        reduce_only: bool = False,
+        max_retries: int = 10,
+    ) -> Optional[TrackedOrder]:
+        """下 Post-Only 限价单，自动处理价格调整"""
+        
+        current_price = price
+        
+        for attempt in range(max_retries):
+            with self._order_lock:
+                result = self.open_position(
+                    side=side,
+                    quantity=quantity,
+                    price=current_price,
+                    order_type="Limit",
+                    reduce_only=reduce_only,
+                    post_only=True,
+                )
+            
+            if isinstance(result, dict) and "error" in result:
+                error_msg = str(result.get("error", "")).lower()
+                
+                # 检查是否是 Post-Only 立即成交的错误
+                if "immediately match" in error_msg or "post-only" in error_msg or "would be taker" in error_msg:
+                    # 调整价格远离盘口
+                    if side == "Bid":
+                        current_price = round_to_tick_size(current_price - self.tick_size, self.tick_size)
+                    else:
+                        current_price = round_to_tick_size(current_price + self.tick_size, self.tick_size)
+                    
+                    if current_price <= 0:
+                        logger.error("价格调整后<=0，无法下单")
+                        return None
+                    
+                    logger.warning("Post-Only 被拒（第 %d 次），调整价格至 %.8f", attempt + 1, current_price)
                     continue
-                if price_val > 0:
-                    return price_val
-        avg_entry = position_state.get("avg_entry")
-        if avg_entry:
-            try:
-                return float(avg_entry)
-            except (TypeError, ValueError):
-                return fallback
-        return fallback
+                else:
+                    logger.error("下单失败: %s", result.get("error"))
+                    return None
+            
+            # 成功下单
+            order_id = result.get("id")
+            if not order_id:
+                logger.error("下单成功但未返回订单ID")
+                return None
+            
+            tracked = TrackedOrder(
+                order_id=str(order_id),
+                role=role,
+                side=side,
+                price=current_price,
+                quantity=quantity,
+            )
+            
+            with self._state_lock:
+                self._tracked_orders[tracked.order_id] = tracked
+            
+            role_name = {
+                OrderRole.ENTRY_BID: "入场买单",
+                OrderRole.ENTRY_ASK: "入场卖单",
+                OrderRole.HEDGE: "对冲单",
+                OrderRole.SCALE_IN: "加仓单",
+            }.get(role, str(role))
+            
+            logger.info("📤 %s已挂出: ID=%s, 方向=%s, 价格=%.8f, 数量=%s",
+                        role_name, order_id, side, current_price, format_balance(quantity))
+            
+            return tracked
+        
+        logger.error("达到最大重试次数，无法下单")
+        return None
 
-    def _reset_round_progress(self) -> None:
-        """在強制結束當前一輪時重置掛單目標與狀態。"""
-        self._current_buy_order_qty = 0.0
-        self._current_sell_order_qty = 0.0
-        self._buy_filled_qty = 0.0
-        self._sell_filled_qty = 0.0
-        self._bid_filled = False
-        self._ask_filled = False
-        self.active_buy_orders = []
-        self.active_sell_orders = []
-        self._scale_ladder_deployed = False
-        self._current_close_order_id = None
-        self._initial_order_ids = {}
-        self._initial_orders_cancelled = False
-
-    def _start_cycle_async(self, delay: float = 0.0) -> None:
-        if getattr(self, "_stop_flag", False):
-            return
-
-        def _fire() -> None:
-            try:
-                if delay > 0:
-                    time.sleep(delay)
-                self.place_limit_orders()
-            except Exception as exc:  # noqa: BLE001
-                logger.error("重新啟動掛單時出錯: %s", exc)
-
-        threading.Thread(target=_fire, daemon=True).start()
-
-    def _place_emergency_close_order(self, position_state: Optional[Dict[str, Any]]) -> bool:
-        if not position_state:
-            return False
-        min_qty = getattr(self, "min_order_size", 0.0)
-        net = float(position_state.get("net", 0.0) or 0.0)
-        if abs(net) < min_qty:
-            return False
-
-        qty = round_to_precision(abs(net), self.base_precision)
-        if qty < min_qty:
-            return False
-
-        hedge_side = "Ask" if net > 0 else "Bid"
-        fallback_price = float(position_state.get("avg_entry", 0.0) or 0.0)
-        exit_price = self._determine_exit_price(position_state, fallback_price)
-        self._cancel_close_order()
-        result = self._place_post_only_perp_order(
-            side=hedge_side,
-            quantity=qty,
-            price=exit_price,
+    def _update_hedge_order_price(self, new_price: float) -> bool:
+        """更新对冲单的价格（取消旧单+下新单）"""
+        with self._state_lock:
+            hedge_order = self._round_state.hedge_order
+            if not hedge_order or not hedge_order.is_active:
+                logger.warning("没有活跃的对冲单需要更新")
+                return False
+            
+            old_price = hedge_order.price
+            old_id = hedge_order.order_id
+            side = hedge_order.side
+            quantity = hedge_order.remaining_qty
+            
+            if abs(new_price - old_price) < self.tick_size / 2:
+                logger.debug("新价格与旧价格相同，跳过更新")
+                return True
+        
+        logger.info("📝 更新对冲单价格: %.8f → %.8f", old_price, new_price)
+        
+        # 1. 取消旧订单
+        self._cancel_order_by_id(old_id)
+        
+        # 2. 下新订单
+        new_order = self._place_post_only_order(
+            side=side,
+            price=new_price,
+            quantity=quantity,
+            role=OrderRole.HEDGE,
             reduce_only=True,
         )
-        if isinstance(result, dict) and "error" in result:
-            logger.error("緊急平倉單下發失敗: %s", result.get("error"))
-            return False
-
-        logger.info(
-            "已掛出緊急平倉單: 方向=%s, 價格=%.8f, 數量=%s",
-            hedge_side,
-            exit_price,
-            format_balance(qty),
-        )
-        return True
-
-    def _cancel_initial_orders(self) -> None:
-        """取消最初掛出的買一/賣一訂單（若仍存在）。"""
-        if not self._initial_order_ids:
-            return
-
-        for side_label, order_id in list(self._initial_order_ids.items()):
-            if not order_id:
-                continue
-            try:
-                result = self.client.cancel_order(order_id, self.symbol)
-                if isinstance(result, dict) and "error" in result:
-                    error_msg = str(result.get("error", ""))
-                    # 如果订单不存在（已成交或已取消），视为成功，使用 debug 级别日志
-                    if "not found" in error_msg.lower() or "does not exist" in error_msg.lower():
-                        logger.debug("初始 %s 訂單 %s 已不存在（可能已成交），跳過取消", side_label, order_id)
-                        self._initial_order_ids.pop(side_label, None)
-                    else:
-                        logger.warning("取消初始 %s 訂單 %s 失敗: %s", side_label, order_id, error_msg)
-                else:
-                    logger.info("已取消初始 %s 訂單 %s", side_label, order_id)
-                    self._initial_order_ids.pop(side_label, None)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("取消初始 %s 訂單 %s 出錯: %s", side_label, order_id, exc)
-        if not self._initial_order_ids:
-            self._initial_orders_cancelled = True
-
-    def _cancel_close_order(self) -> None:
-        """取消已記錄的 reduce-only 平倉單，並同步檢查其他 reduce-only 掛單是否存在。"""
-        order_id = self._current_close_order_id
-        if order_id:
-            try:
-                result = self.client.cancel_order(order_id, self.symbol)
-                if isinstance(result, dict) and "error" in result:
-                    logger.warning("取消平倉單 %s 失敗: %s", order_id, result.get("error"))
-                else:
-                    logger.info("已取消舊的平倉單 %s", order_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("取消平倉單 %s 出錯: %s", order_id, exc)
-            finally:
-                self._current_close_order_id = None
-
-        # 再遍歷一次當前掛單，確保沒有遺留的 reduce-only 掛單
-        try:
-            open_orders = self.client.get_open_orders(self.symbol)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("檢查遺留平倉單失敗: %s", exc)
-            return
-
-        if isinstance(open_orders, dict) and "error" in open_orders:
-            logger.warning("獲取掛單列表失敗: %s", open_orders.get("error"))
-            return
-
-        if not open_orders:
-            return
-
-        for order in open_orders:
-            try:
-                if not order:
-                    continue
-                if not order.get("reduceOnly"):
-                    continue
-                oid = order.get("id")
-                if not oid:
-                    continue
-                result = self.client.cancel_order(oid, self.symbol)
-                if isinstance(result, dict) and "error" in result:
-                    logger.warning("取消遺留平倉單 %s 失敗: %s", oid, result.get("error"))
-                else:
-                    logger.info("已取消遺留平倉單 %s", oid)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("取消遺留平倉單時出錯: %s", exc)
-
-    def _handle_order_submission_failure(self, side: str, error: Any) -> None:
-        logger.warning("方向 %s 掛單失敗，啟動恢復流程: %s", side, error)
-        try:
-            self.cancel_existing_orders()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("恢復流程取消訂單失敗: %s", exc)
-
-        self._reset_round_progress()
-
-        position_state: Optional[Dict[str, Any]] = None
-        if hasattr(self, "get_position_state"):
-            try:
-                position_state = self.get_position_state()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("恢復流程獲取倉位失敗: %s", exc)
-
-        min_qty = getattr(self, "min_order_size", 0.0)
-        net = 0.0
-        if position_state:
-            net = float(position_state.get("net", 0.0) or 0.0)
-
-        if position_state and abs(net) >= min_qty:
-            placed = self._place_emergency_close_order(position_state)
-            self._restart_on_flat = placed
-            if not placed:
-                logger.warning("緊急平倉單未成功掛出，暫停重新循環，請檢查倉位")
+        
+        if new_order:
+            with self._state_lock:
+                self._round_state.hedge_order = new_order
+            logger.info("✅ 对冲单价格已更新: 新ID=%s, 新价格=%.8f", new_order.order_id, new_price)
+            return True
         else:
-            self._restart_on_flat = False
-            # 略微延遲後重新開始一輪，避免立即命中相同價格
-            self._start_cycle_async(delay=1.0)
-
-    def _is_post_only_immediate_match_error(self, error_message: Optional[str]) -> bool:
-        if not error_message:
+            logger.error("❌ 更新对冲单价格失败")
             return False
-        text = str(error_message).lower()
-        if "immediately match" in text:
-            return True
-        if "post-only" in text or "post only" in text:
-            return True
-        if "would be taker" in text:
-            return True
-        return False
 
-    def _adjust_price_for_post_only(self, side: str, price: float) -> float:
-        tick = getattr(self, "tick_size", 0.0) or 0.0
-        if tick <= 0:
-            return price
-        normalized_side = (side or "").lower()
-        if normalized_side == "bid":
-            new_price = price - tick
-            if new_price <= 0:
-                return price
-            return round_to_tick_size(new_price, tick)
-        new_price = price + tick
-        return round_to_tick_size(new_price, tick)
+    def _cancel_order_by_id(self, order_id: str) -> bool:
+        """取消指定订单"""
+        try:
+            result = self.client.cancel_order(order_id, self.symbol)
+            if isinstance(result, dict) and "error" in result:
+                error_msg = str(result.get("error", "")).lower()
+                if "not found" in error_msg or "does not exist" in error_msg:
+                    logger.debug("订单 %s 已不存在（可能已成交）", order_id)
+                    return True
+                logger.warning("取消订单 %s 失败: %s", order_id, result.get("error"))
+                return False
+            
+            logger.info("🗑️ 已取消订单: %s", order_id)
+            
+            with self._state_lock:
+                if order_id in self._tracked_orders:
+                    self._tracked_orders[order_id].is_active = False
+            
+            return True
+        except Exception as e:
+            logger.error("取消订单 %s 时出错: %s", order_id, e)
+            return False
 
-    def _place_post_only_perp_order(
-        self,
-        *,
-        side: str,
-        quantity: float,
-        price: float,
-        reduce_only: bool,
-    ) -> Any:
-        """下發 Post-Only 限價單，若因即時成交被拒則自動調整一檔價格再試。"""
-        current_price = price
-        attempts = 0
-        last_result: Any = None
+    def _cancel_all_tracked_orders(self) -> None:
+        """取消所有追踪的订单"""
+        with self._state_lock:
+            order_ids = list(self._tracked_orders.keys())
+        
+        for order_id in order_ids:
+            self._cancel_order_by_id(order_id)
 
-        while attempts <= self._max_post_only_adjustments:
-            last_result = self.open_position(
-                side=side,
-                quantity=quantity,
-                price=current_price,
-                order_type="Limit",
-                reduce_only=reduce_only,
-                post_only=True,
+    def _cancel_entry_orders_except(self, keep_side: Optional[str] = None) -> None:
+        """取消入场订单（保留指定方向的）"""
+        with self._state_lock:
+            orders_to_cancel = []
+            for order in self._tracked_orders.values():
+                if order.role in (OrderRole.ENTRY_BID, OrderRole.ENTRY_ASK):
+                    if keep_side and order.side == keep_side:
+                        continue
+                    if order.is_active:
+                        orders_to_cancel.append(order.order_id)
+        
+        for order_id in orders_to_cancel:
+            self._cancel_order_by_id(order_id)
+
+    # ============================================================
+    # 加仓逻辑
+    # ============================================================
+    
+    def _place_scale_in_orders(self, direction: str, entry_price: float, current_position: float) -> None:
+        """挂加仓订单梯队"""
+        if self.scale_in_price_step_pct <= 0 or self.scale_in_size_pct <= 0:
+            logger.debug("未配置加仓参数，跳过加仓单")
+            return
+        
+        if current_position >= self.max_position - self.min_order_size / 2:
+            logger.info("当前仓位已达最大限制，无需加仓单")
+            return
+        
+        price_step_ratio = self.scale_in_price_step_pct / 100.0
+        size_ratio = self.scale_in_size_pct / 100.0
+        
+        remaining_capacity = self.max_position - current_position
+        current_size = current_position
+        level = 0
+        base_price = entry_price
+        
+        scale_in_orders = []
+        
+        while current_size < self.max_position - self.min_order_size / 2:
+            level += 1
+            
+            # 计算加仓价格
+            if direction == "LONG":
+                # 多头加仓：价格下跌时加仓
+                scale_price = base_price * (1.0 - price_step_ratio * level)
+                scale_side = "Bid"
+            else:
+                # 空头加仓：价格上涨时加仓
+                scale_price = base_price * (1.0 + price_step_ratio * level)
+                scale_side = "Ask"
+            
+            scale_price = round_to_tick_size(scale_price, self.tick_size)
+            if scale_price <= 0:
+                break
+            
+            # 计算加仓数量
+            add_qty = current_size * size_ratio
+            add_qty = min(add_qty, remaining_capacity)
+            add_qty = round_to_precision(add_qty, self.base_precision)
+            
+            if add_qty < self.min_order_size:
+                logger.debug("加仓数量 %s 低于最小单位，停止加仓", format_balance(add_qty))
+                break
+            
+            # 下加仓单
+            order = self._place_post_only_order(
+                side=scale_side,
+                price=scale_price,
+                quantity=add_qty,
+                role=OrderRole.SCALE_IN,
+                reduce_only=False,
             )
+            
+            if order:
+                scale_in_orders.append(order)
+                current_size += add_qty
+                remaining_capacity -= add_qty
+                logger.info("📈 加仓单 #%d: 价格=%.8f, 数量=%s", level, scale_price, format_balance(add_qty))
+            else:
+                logger.warning("加仓单 #%d 挂单失败", level)
+                break
+            
+            # 防止无限循环
+            if level >= 20:
+                break
+        
+        with self._state_lock:
+            self._round_state.scale_in_orders = scale_in_orders
+        
+        if scale_in_orders:
+            logger.info("✅ 已挂出 %d 个加仓单", len(scale_in_orders))
 
-            if not (isinstance(last_result, dict) and "error" in last_result):
-                if reduce_only:
-                    order_id = last_result.get("id")
-                    self._current_close_order_id = str(order_id) if order_id else None
-                return last_result
-
-            error_text = str(last_result.get("error"))
-            if not self._is_post_only_immediate_match_error(error_text):
-                return last_result
-
-            adjusted_price = self._adjust_price_for_post_only(side, current_price)
-            if adjusted_price == current_price or adjusted_price <= 0:
-                logger.error(
-                    "Post-only 價格調整失敗 (方向=%s, 原價=%s)，無法繼續遠離當前價格",
-                    side,
-                    format_balance(current_price),
-                )
-                return last_result
-
-            attempts += 1
-            logger.warning(
-                "Post-only 價格 %s 被拒 (立即成交)，嘗試第 %d 檔價格 %s",
-                format_balance(current_price),
-                attempts,
-                format_balance(adjusted_price),
-            )
-            current_price = adjusted_price
-
-        logger.error(
-            "Post-only 價格已調整 %d 次仍無法成功下單 (方向=%s, 最終價格=%s)",
-            self._max_post_only_adjustments,
-            side,
-            format_balance(current_price),
-        )
-        return last_result
-
-    # ------------------------------------------------------------------
-    # 成交后置处理
-    # ------------------------------------------------------------------
+    # ============================================================
+    # 成交事件处理
+    # ============================================================
+    
     def _after_fill_processed(self, fill_info: Dict[str, Any]) -> None:
-        """记录成交，不进行对冲，只更新本轮成交进度。
-
-        僅當買單與賣單「全部成交」後，下一輪掛單才會在 `place_limit_orders` 中啟動。
-        """
-
+        """处理成交事件（覆盖父类方法）"""
         super()._after_fill_processed(fill_info)
-
-        # 成交事件去重：防止 WebSocket 重复推送导致数量累加错误
+        
+        # 去重检查
         fill_id = fill_info.get("fill_id") or fill_info.get("trade_id") or fill_info.get("tradeId")
         if fill_id:
             fill_id_str = str(fill_id)
             if fill_id_str in self._processed_fill_ids:
-                logger.debug("跳过已处理的成交事件: %s", fill_id_str)
+                logger.debug("跳过重复的成交事件: %s", fill_id_str)
                 return
+            
             self._processed_fill_ids.add(fill_id_str)
-            # 防止集合无限增长，保留最近 1000 条记录
-            if len(self._processed_fill_ids) > 1000:
-                # 由于 set 无序，这里简单清空旧记录（实际生产环境可考虑使用 OrderedDict 或 LRU）
-                oldest_to_remove = list(self._processed_fill_ids)[:500]
-                for old_id in oldest_to_remove:
+            self._recent_fill_ids.append(fill_id_str)
+            
+            # 清理旧的记录
+            if len(self._processed_fill_ids) > 2000:
+                while len(self._recent_fill_ids) > 500:
+                    old_id = self._recent_fill_ids.popleft()
                     self._processed_fill_ids.discard(old_id)
-
+        
+        order_id = str(fill_info.get("order_id", ""))
         side = fill_info.get("side")
         quantity = float(fill_info.get("quantity", 0) or 0)
         price = float(fill_info.get("price", 0) or 0)
-        order_id = fill_info.get("order_id")
-
-        if order_id and self._current_close_order_id and str(order_id) == str(self._current_close_order_id):
-            logger.info("平倉單 %s 成交，清除追蹤 ID", order_id)
-            self._current_close_order_id = None
-
-        # 如果成交的订单是初始订单之一，立即从追踪列表中移除，避免后续取消时报错
-        if order_id and hasattr(self, "_initial_order_ids") and self._initial_order_ids:
-            order_id_str = str(order_id)
-            for side_label in list(self._initial_order_ids.keys()):
-                if str(self._initial_order_ids.get(side_label)) == order_id_str:
-                    logger.debug("初始 %s 訂單 %s 已成交，從追蹤列表移除", side_label, order_id_str)
-                    self._initial_order_ids.pop(side_label, None)
-                    break
-
-        if not side or quantity <= 0 or price <= 0:
-            logger.warning("成交信息不完整，跳过处理")
+        
+        if not order_id or not side or quantity <= 0:
+            logger.warning("成交信息不完整: %s", fill_info)
             return
-
-        # 更新當前一輪的成交累計，僅當累計數量達到目標時才視為「完全成交」
-        if side == "Bid":
-            self._buy_filled_qty += quantity
-            logger.info("💰 买单成交: 累计 %.8f / 目标 %.8f @ %.8f", self._buy_filled_qty, self._current_buy_order_qty, price)
-            if self._current_buy_order_qty > 0.0 and self._buy_filled_qty + self._fill_tolerance >= self._current_buy_order_qty:
-                self._bid_filled = True
-                logger.info("✅ 买单已全部成交")
-        elif side == "Ask":
-            self._sell_filled_qty += quantity
-            logger.info("💰 卖单成交: 累计 %.8f / 目标 %.8f @ %.8f", self._sell_filled_qty, self._current_sell_order_qty, price)
-            if self._current_sell_order_qty > 0.0 and self._sell_filled_qty + self._fill_tolerance >= self._current_sell_order_qty:
-                self._ask_filled = True
-                logger.info("✅ 卖单已全部成交")
-
-        self._maybe_trigger_next_round()
-
-        # 无论当前是否已全部成交，只要有成交发生，就尝试检查加仓逻辑
-        # 移至 _maybe_trigger_next_round 之后，以防需要先进入下一轮
-        self._handle_perp_scale_and_hedge(side=side, quantity=quantity, price=price)
-
-    # ------------------------------------------------------------------
-    # 加仓与平仓逻辑（永续合约专用）
-    # ------------------------------------------------------------------
-    def _maybe_handle_scale_in(self) -> bool:
-        """永续合约纯Maker的加仓/平仓逻辑。
-
-        返回 True 表示本轮已处理加仓/平仓且不再执行常规挂单；
-        返回 False 表示应继续执行常规挂单逻辑。
-        """
-        # 未开启加仓功能，直接执行常规挂单
-        if getattr(self, "scale_in_price_step_pct", 0.0) <= 0.0 or getattr(self, "scale_in_size_pct", 0.0) <= 0.0:
-            return False
-
-        # 仅在永续合约策略中生效（需要有仓位信息和最大持仓限制）
-        if not hasattr(self, "get_position_state") or not hasattr(self, "max_position"):
-            return False
-
-        try:
-            position_state = self.get_position_state()
-        except Exception as exc:
-            logger.error("获取仓位状态失败，跳过加仓检查: %s", exc)
-            return False
-
+        
+        logger.info("💰 收到成交通知: 订单=%s, 方向=%s, 价格=%.8f, 数量=%s",
+                    order_id, side, price, format_balance(quantity))
+        
+        # 更新追踪的订单状态
+        with self._state_lock:
+            tracked = self._tracked_orders.get(order_id)
+            if tracked:
+                tracked.filled_qty += quantity
+                logger.info("   └─ 订单角色=%s, 已成交=%s/%s", 
+                            tracked.role.value, 
+                            format_balance(tracked.filled_qty),
+                            format_balance(tracked.quantity))
+        
+        # 更新成交量统计
+        self._total_volume += quantity * price
+        
+        # 获取当前仓位状态
+        position_state = self.get_position_state()
         net = float(position_state.get("net", 0.0) or 0.0)
         direction = position_state.get("direction")
-        current_price = float(position_state.get("current_price", 0.0) or 0.0)
+        break_even_price = float(position_state.get("break_even_price", 0.0) or 0.0)
         avg_entry = float(position_state.get("avg_entry", 0.0) or 0.0)
+        
+        logger.info("   └─ 当前仓位: net=%.8f, 方向=%s, 均价=%.8f, 盈亏平衡价=%.8f",
+                    net, direction, avg_entry, break_even_price)
+        
+        # 处理成交逻辑
+        self._handle_fill_logic(order_id, side, quantity, price, net, direction, break_even_price, avg_entry)
 
-        # 无有效仓位则退出加仓模式，交给常规挂单处理
-        if abs(net) < getattr(self, "min_order_size", 0.0) or not current_price or not avg_entry:
-            self._scale_in_last_ref_price = 0.0
-            return False
+    def _handle_fill_logic(
+        self,
+        order_id: str,
+        side: str,
+        quantity: float,
+        price: float,
+        net: float,
+        direction: str,
+        break_even_price: float,
+        avg_entry: float,
+    ) -> None:
+        """处理成交后的逻辑"""
+        with self._state_lock:
+            tracked = self._tracked_orders.get(order_id)
+            if not tracked:
+                logger.debug("未追踪的订单成交: %s", order_id)
+                return
+            
+            role = tracked.role
+            round_state = self._round_state
+        
+        # 情况1: 入场单成交
+        if role in (OrderRole.ENTRY_BID, OrderRole.ENTRY_ASK):
+            self._on_entry_order_filled(tracked, net, direction, break_even_price, avg_entry)
+        
+        # 情况2: 加仓单成交
+        elif role == OrderRole.SCALE_IN:
+            self._on_scale_in_order_filled(tracked, net, direction, break_even_price)
+        
+        # 情况3: 对冲单成交
+        elif role == OrderRole.HEDGE:
+            self._on_hedge_order_filled(tracked, net)
 
-        max_position = float(getattr(self, "max_position", 0.0) or 0.0)
-        if max_position <= 0.0:
-            # 有仓位但没有有效上限，暂不再挂普通Maker单
-            return True
-
-        # 初始化参考价格为当前平均成本
-        if self._scale_in_last_ref_price <= 0.0:
-            self._scale_in_last_ref_price = avg_entry
-
-        step_ratio = self.scale_in_price_step_pct / 100.0
-        should_scale_in = False
-
-        if direction == "LONG":
-            trigger_price = self._scale_in_last_ref_price * (1.0 - step_ratio)
-            if current_price <= trigger_price:
-                should_scale_in = True
-        elif direction == "SHORT":
-            trigger_price = self._scale_in_last_ref_price * (1.0 + step_ratio)
-            if current_price >= trigger_price:
-                should_scale_in = True
+    def _on_entry_order_filled(
+        self, 
+        order: TrackedOrder, 
+        net: float, 
+        direction: str,
+        break_even_price: float,
+        avg_entry: float,
+    ) -> None:
+        """入场单成交处理"""
+        logger.info("🎯 入场单成交！方向=%s, 仓位=%s", direction, format_balance(net))
+        
+        with self._state_lock:
+            # 记录入场订单
+            self._round_state.entry_order = order
+            self._round_state.position_direction = direction
+        
+        # 取消另一侧的入场单
+        if order.side == "Bid":
+            self._cancel_entry_orders_except(keep_side="Bid")
         else:
-            # FLAT 或未知方向，退出加仓模式
-            self._scale_in_last_ref_price = 0.0
-            return False
-
+            self._cancel_entry_orders_except(keep_side="Ask")
+        
+        # 计算对冲价格（使用 breakEvenPrice）
+        hedge_price = break_even_price if break_even_price > 0 else avg_entry
+        if hedge_price <= 0:
+            hedge_price = order.price  # 回退到入场价格
+        
+        hedge_price = round_to_tick_size(hedge_price, self.tick_size)
+        
+        # 确定对冲方向
         current_size = abs(net)
-
-        # 未触发新一档加仓，但已有仓位 -> 保持加仓模式，不再挂常规Maker单
-        if not should_scale_in:
-            return True
-
-        # 计算本次加仓数量：在当前仓位基础上增加 scale_in_size_pct%，但不超过 max_position
-        target_size = min(
-            max_position,
-            current_size * (1.0 + self.scale_in_size_pct / 100.0),
-        )
-        add_qty = max(0.0, target_size - current_size)
-        add_qty = round_to_precision(add_qty, self.base_precision)
-
-        if add_qty < self.min_order_size:
-            logger.info(
-                "加仓目标数量 %s 低于最小下单单位 %s，跳过加仓",
-                format_balance(add_qty),
-                format_balance(self.min_order_size),
-            )
-            self._scale_in_last_ref_price = current_price
-            return True
-
-        logger.info(
-            "触发加仓逻辑: 方向=%s, 当前价=%.8f, 参考价=%.8f, 当前仓位=%s, 计划加仓=%s, 最大仓位=%s",
-            direction,
-            current_price,
-            self._scale_in_last_ref_price,
-            format_balance(current_size),
-            format_balance(add_qty),
-            format_balance(max_position),
-        )
-
-        # 1) 取消当前所有挂单
-        self.cancel_existing_orders()
-
-        # 2) 在当前盘口附近挂出新的加仓单（Post-Only）
-        bid_price, ask_price = self.get_market_depth()
-        if bid_price is None or ask_price is None:
-            logger.warning("无法获取买一/卖一价格，加仓挂单跳过")
-            self._scale_in_last_ref_price = current_price
-            return True
-
         if direction == "LONG":
-            entry_side = "Bid"
-            entry_price = round_to_tick_size(bid_price, self.tick_size)
-            close_side = "long"
+            hedge_side = "Ask"  # 多头需要卖出平仓
         else:
-            entry_side = "Ask"
-            entry_price = round_to_tick_size(ask_price, self.tick_size)
-            close_side = "short"
-
-        entry_result = self._place_post_only_perp_order(
-            side=entry_side,
-            quantity=add_qty,
-            price=entry_price,
-            reduce_only=False,
-        )
-        if isinstance(entry_result, dict) and "error" in entry_result:
-            logger.error("加仓下单失败: %s", entry_result.get("error"))
-            self._scale_in_last_ref_price = current_price
-            return True
-
-        # 3) 预估新的平均成本，并在成本价挂出平仓单
-        expected_size = current_size + add_qty
-        if expected_size <= 0:
-            self._scale_in_last_ref_price = current_price
-            return True
-
-        new_avg_price = (avg_entry * current_size + entry_price * add_qty) / expected_size
-
-        # 使用 reduceOnly 限價單，在成本價附近平掉「全部預期倉位」
-        close_order_side = "Ask" if close_side == "long" else "Bid"
-        exit_price = self._determine_exit_price(position_state, new_avg_price)
-        self._cancel_close_order()
-        close_result = self._place_post_only_perp_order(
-            side=close_order_side,
-            quantity=expected_size,
-            price=exit_price,
+            hedge_side = "Bid"  # 空头需要买入平仓
+        
+        logger.info("📤 准备挂对冲单: 方向=%s, 价格=%.8f, 数量=%s", 
+                    hedge_side, hedge_price, format_balance(current_size))
+        
+        # 挂对冲单
+        hedge_order = self._place_post_only_order(
+            side=hedge_side,
+            price=hedge_price,
+            quantity=current_size,
+            role=OrderRole.HEDGE,
             reduce_only=True,
         )
-        if isinstance(close_result, dict) and "error" in close_result:
-            logger.warning("平仓挂单失败: %s", close_result.get("error"))
-        else:
-            logger.info(
-                "已在成本价挂出平仓单: 方向=%s, 价格=%.8f, 数量=%s",
-                close_side,
-                exit_price,
-                format_balance(expected_size),
-            )
-
-        # 更新下一档加仓的参考价格
-        self._scale_in_last_ref_price = current_price
-
-        # 进入加仓模式后，本轮不再执行普通Maker挂单
-        return True
-
-    def _handle_perp_scale_and_hedge(self, side: str, quantity: float, price: float) -> None:
-        """永续合约纯Maker的加仓/对冲逻辑（以成交事件为驱动）。
         
-        核心逻辑：
-        1. 仓位归零 -> 启动下一轮
-        2. 首次产生仓位 -> 取消另一侧初始订单，挂对冲单，挂加仓梯队
-        3. 加仓成交 -> 更新对冲单价格和数量
-        """
-        # 仅在永续合约环境中生效
-        if not hasattr(self, "get_position_state"):
-            return
+        if hedge_order:
+            with self._state_lock:
+                self._round_state.hedge_order = hedge_order
+            logger.info("✅ 对冲单已挂出")
+        else:
+            logger.error("❌ 对冲单挂单失败")
+        
+        # 挂加仓订单
+        self._place_scale_in_orders(direction, avg_entry if avg_entry > 0 else order.price, current_size)
 
+    def _on_scale_in_order_filled(
+        self,
+        order: TrackedOrder,
+        net: float,
+        direction: str,
+        break_even_price: float,
+    ) -> None:
+        """加仓单成交处理"""
+        logger.info("📈 加仓单成交！当前仓位=%s", format_balance(net))
+        
+        # 更新对冲单价格为新的 breakEvenPrice
+        if break_even_price > 0:
+            new_price = round_to_tick_size(break_even_price, self.tick_size)
+            
+            # 同时更新对冲单的数量为当前仓位
+            current_size = abs(net)
+            with self._state_lock:
+                if self._round_state.hedge_order:
+                    self._round_state.hedge_order.quantity = current_size
+            
+            logger.info("📝 加仓后更新对冲单: 新价格=%.8f, 新数量=%s", new_price, format_balance(current_size))
+            self._update_hedge_order_price(new_price)
+        else:
+            logger.warning("无法获取 breakEvenPrice，跳过对冲单价格更新")
+
+    def _on_hedge_order_filled(self, order: TrackedOrder, net: float) -> None:
+        """对冲单成交处理"""
+        logger.info("🏁 对冲单成交！")
+        
+        # 检查仓位是否归零
+        tolerance = self.min_order_size / 10
+        if abs(net) <= tolerance:
+            logger.info("✅ 仓位已归零！第 %d 轮完成", self._round_count)
+            logger.info("📊 累计刷量: %.2f %s", self._total_volume, self.quote_asset)
+            
+            with self._state_lock:
+                self._round_state.is_completed = True
+            
+            # 取消所有剩余订单（如加仓单）
+            self._cancel_remaining_scale_in_orders()
+            
+            # 调度下一轮
+            self._schedule_next_round()
+        else:
+            logger.info("   └─ 仓位未完全归零 (剩余 %.8f)，等待继续平仓", net)
+
+    def _cancel_remaining_scale_in_orders(self) -> None:
+        """取消剩余的加仓单"""
+        with self._state_lock:
+            scale_in_orders = self._round_state.scale_in_orders
+        
+        for order in scale_in_orders:
+            if order.is_active and not order.is_fully_filled:
+                self._cancel_order_by_id(order.order_id)
+
+    # ============================================================
+    # 辅助方法
+    # ============================================================
+    
+    def _calculate_order_quantity(self, reference_price: float) -> Optional[float]:
+        """计算订单数量"""
+        if self.order_quantity is not None and self.order_quantity > 0:
+            return round_to_precision(self.order_quantity, self.base_precision)
+        
+        # 自动计算：使用最大仓位的一定比例
+        qty = self.max_position * 0.2  # 使用最大仓位的 20% 作为单笔订单
+        qty = round_to_precision(qty, self.base_precision)
+        
+        if qty < self.min_order_size:
+            qty = self.min_order_size
+        
+        return qty
+
+    def place_limit_orders(self) -> None:
+        """覆盖父类方法，改为启动新一轮"""
+        self._start_new_round()
+
+    # ============================================================
+    # 运行入口
+    # ============================================================
+    
+    def run(self, duration_seconds: int = 3600, interval_seconds: int = 60) -> None:
+        """运行策略（事件驱动模式）"""
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("开始运行纯 Maker-Maker 刷量策略")
+        logger.info("  运行时长: %d 秒", duration_seconds)
+        logger.info("  模式: 事件驱动")
+        logger.info("=" * 60)
+        
+        start_time = time.time()
+        self._stop_flag = False
+        
+        try:
+            # 确保 WebSocket 连接
+            self.check_ws_connection()
+            if self.ws is not None:
+                try:
+                    self._ensure_data_streams()
+                except Exception as e:
+                    logger.warning("初始化数据流时出错: %s", e)
+            
+            # 启动第一轮
+            self._start_new_round()
+            
+            # 主循环：保持运行并定期输出统计
+            report_interval = 300  # 每5分钟输出一次统计
+            last_report = start_time
+            
+            while time.time() - start_time < duration_seconds and not self._stop_flag:
+                now = time.time()
+                
+                # 定期统计
+                if now - last_report >= report_interval:
+                    self._print_stats()
+                    last_report = now
+                
+                time.sleep(1)
+            
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("策略运行结束")
+            self._print_stats()
+            logger.info("=" * 60)
+            
+        except KeyboardInterrupt:
+            logger.info("用户中断，停止策略")
+            self._stop_flag = True
+        finally:
+            self._cancel_all_tracked_orders()
+
+    def _print_stats(self) -> None:
+        """打印统计信息"""
+        logger.info("")
+        logger.info("📊 统计信息")
+        logger.info("  完成轮数: %d", self._round_count)
+        logger.info("  累计刷量: %.2f %s", self._total_volume, self.quote_asset)
+        
         try:
             position_state = self.get_position_state()
-        except Exception as exc:
-            logger.error("更新加仓/对冲时获取仓位失败: %s", exc)
-            return
+            net = float(position_state.get("net", 0.0) or 0.0)
+            logger.info("  当前仓位: %s", format_balance(net))
+        except Exception:
+            pass
 
-        net = float(position_state.get("net", 0.0) or 0.0)
-        direction = position_state.get("direction")
-        avg_entry = float(position_state.get("avg_entry", 0.0) or 0.0)
-        current_price = float(position_state.get("current_price", 0.0) or 0.0)
-
-        min_qty = getattr(self, "min_order_size", 0.0)
-        prev_net = getattr(self, "_scale_in_last_net", 0.0)
-
-        # 將極小倉位視為 0，避免噪音
-        if abs(net) < min_qty / 10:
-            net = 0.0
-
-        # 情況 1: 倉位從非 0 回到 0 -> 認為本輪結束，取消加倉單並開啟下一輪
-        if net == 0.0 and abs(prev_net) >= min_qty:
-            logger.info("倉位已歸零，取消所有加倉/對沖掛單，準備進入下一輪純Maker循環")
-            self._scale_in_last_ref_price = 0.0
-            self._scale_in_last_net = 0.0
-            self._cancel_close_order()
-            try:
-                self.cancel_existing_orders()
-            except Exception as exc:
-                logger.error("取消剩余掛單失敗: %s", exc)
-            self._reset_round_progress()
-            if self._restart_on_flat:
-                self._restart_on_flat = False
-                self._start_cycle_async(delay=0.0)
-            else:
-                self._schedule_next_round()
-            return
-
-        # 更新記錄的上一筆倉位
-        self._scale_in_last_net = net
-
-        # 沒有有效持倉或缺少成本價信息時，不進行加倉/對沖處理
-        if net == 0.0 or not avg_entry or direction not in ("LONG", "SHORT"):
-            return
-
-        current_size = abs(net)
-        max_position = float(getattr(self, "max_position", 0.0) or 0.0)
-        scale_in_enabled = (
-            getattr(self, "scale_in_price_step_pct", 0.0) > 0.0 
-            and getattr(self, "scale_in_size_pct", 0.0) > 0.0
-        )
-        step_ratio = self.scale_in_price_step_pct / 100.0 if scale_in_enabled else 0.0
-
-        # 情況 2: 首次產生倉位 -> 取消另一側初始訂單，掛對沖單，掛加倉梯隊
-        is_first_entry = (abs(prev_net) < min_qty and current_size >= min_qty)
-        missing_ladder = (current_size >= min_qty and not self._scale_ladder_deployed and scale_in_enabled)
-
-        if is_first_entry or missing_ladder:
-            logger.info(
-                "触发首次建仓/加仓检查: 首笔=%s, 缺梯队=%s (当前仓位=%s, 上次仓位=%s)",
-                is_first_entry,
-                missing_ladder,
-                format_balance(current_size),
-                format_balance(prev_net),
-            )
-            
-            # 取消另一侧的初始订单
-            if not self._initial_orders_cancelled:
-                self._cancel_initial_orders()
-            
-            # 挂对冲单（在成本价平仓）
-            hedge_side = "Ask" if direction == "LONG" else "Bid"
-            exit_price = self._determine_exit_price(position_state, avg_entry)
-            hedge_price = round_to_tick_size(exit_price, self.tick_size)
-            hedge_qty = round_to_precision(current_size, self.base_precision)
-            
-            if hedge_qty >= min_qty:
-                self._cancel_close_order()
-                logger.info(
-                    "首次建仓后挂对冲单: 方向=%s, 价格=%.8f, 数量=%s",
-                    hedge_side,
-                    hedge_price,
-                    format_balance(hedge_qty),
-                )
-                self._place_post_only_perp_order(
-                    side=hedge_side,
-                    quantity=hedge_qty,
-                    price=hedge_price,
-                    reduce_only=True,
-                )
-            
-            # 如果配置了加仓参数，挂加仓梯队
-            self._scale_in_last_ref_price = avg_entry
-            if scale_in_enabled and max_position > 0.0 and not self._scale_ladder_deployed:
-                deployed = self._place_scale_in_ladder(
-                    direction=direction,
-                    base_price=avg_entry,
-                    current_size=current_size,
-                    max_position=max_position,
-                    step_ratio=step_ratio,
-                )
-                if deployed:
-                    self._scale_ladder_deployed = True
-            return
-
-        # 情況 3: 同方向持倉增加，視為加倉成交 -> 取消舊對沖單，按新成本價重掛對沖
-        if prev_net != 0.0 and (net > 0) == (prev_net > 0) and current_size > abs(prev_net) + min_qty / 10:
-            logger.info(
-                "檢測到加倉成交: 舊倉位=%s, 新倉位=%s",
-                format_balance(prev_net),
-                format_balance(net),
-            )
-
-            if not self._initial_orders_cancelled:
-                self._cancel_initial_orders()
-            self._cancel_close_order()
-
-            hedge_side = "Ask" if direction == "LONG" else "Bid"
-            exit_price = self._determine_exit_price(position_state, avg_entry)
-            hedge_price = round_to_tick_size(exit_price, self.tick_size)
-            hedge_qty = round_to_precision(current_size, self.base_precision)
-
-            if hedge_qty >= min_qty:
-                logger.info(
-                    "以成本價掛出新的對沖單: 方向=%s, 價格=%.8f, 數量=%s",
-                    hedge_side,
-                    hedge_price,
-                    format_balance(hedge_qty),
-                )
-                self._place_post_only_perp_order(
-                    side=hedge_side,
-                    quantity=hedge_qty,
-                    price=hedge_price,
-                    reduce_only=True,
-                )
-
-            self._scale_in_last_ref_price = avg_entry
-
-    def _place_scale_in_ladder(
-        self,
-        direction: str,
-        base_price: float,
-        current_size: float,
-        max_position: float,
-        step_ratio: float,
-    ) -> bool:
-        """根據當前持倉與配置一次性掛出剩餘所有加倉單。
-
-        返回 True 表示至少成功掛出一筆加倉單。
-        """
-        min_qty = getattr(self, "min_order_size", 0.0)
-        if max_position <= 0.0 or current_size >= max_position - min_qty / 2:
-            logger.info("持倉已接近或達到最大上限，無需額外加倉單")
-            return False
-
-        if self.scale_in_size_pct <= 0.0 or step_ratio <= 0.0:
-            logger.info("未設定有效的加倉步長/比例，跳過加倉梯度")
-            return False
-
-        price_step = abs(base_price) * step_ratio
-        if price_step <= 0:
-            logger.info("加倉價格步長無效，跳過加倉梯度")
-            return False
-
-        # 初始化
-        remaining_size = current_size
-        level = 0
-        orders_placed = 0
-
-        while remaining_size + min_qty <= max_position:
-            target_size = min(
-                max_position,
-                remaining_size * (1.0 + self.scale_in_size_pct / 100.0),
-            )
-            add_qty = max(0.0, target_size - remaining_size)
-            add_qty = round_to_precision(add_qty, self.base_precision)
-
-            if add_qty < min_qty:
-                logger.info(
-                    "加倉梯度剩餘數量 %s 低於最小下單單位 %s，停止掛單",
-                    format_balance(add_qty),
-                    format_balance(min_qty),
-                )
-                break
-
-            level += 1
-            if direction == "LONG":
-                price = base_price - price_step * level
-                side = "Bid"
-            else:
-                price = base_price + price_step * level
-                side = "Ask"
-
-            price = round_to_tick_size(price, self.tick_size)
-            if price <= 0:
-                logger.warning("加倉價計算結果<=0（方向=%s），停止掛單", direction)
-                break
-
-            logger.info(
-                "掛出加倉梯度 #%d: 方向=%s, 價格=%.8f, 數量=%s",
-                level,
-                side,
-                price,
-                format_balance(add_qty),
-            )
-
-            result = self._place_post_only_perp_order(
-                side=side,
-                quantity=add_qty,
-                price=price,
-                reduce_only=False,
-            )
-            if isinstance(result, dict) and "error" in result:
-                logger.error("加倉梯度 #%d 下單失敗: %s", level, result.get("error"))
-                break
-
-            orders_placed += 1
-            remaining_size = target_size
-
-            # 若已達到最大倉位上限則停止
-            if remaining_size >= max_position - min_qty / 2:
-                break
-
-        if orders_placed == 0:
-            logger.info("未能掛出任何加倉梯度（方向=%s）", direction)
-            return False
-
-        logger.info("已掛出 %d 筆加倉梯度訂單", orders_placed)
-        return True
-
-    def run(self, duration_seconds: int = 3600, interval_seconds: int = 60):  # type: ignore[override]
-        """純 Maker-Maker 策略運行入口（事件驅動，不使用 interval 輪詢）。
-
-        - 初始在買一/賣一掛出對稱 Maker 單
-        - 後續完整循環由成交事件驅動（參見 `_after_fill_processed` / `_handle_perp_scale_and_hedge`）
-        - 不再在每次迭代中主動調用 `place_limit_orders`，也不輸出「等待 X 秒」日誌
-        """
-        logger.info(f"開始運行純 Maker-Maker 策略: {self.symbol}")
-        logger.info(f"運行時間上限: {duration_seconds} 秒 (事件驅動模式, interval 參數將被忽略)")
-
-        start_time = time.time()
-
-        try:
-            # 確保連接與數據流
-            connection_status = self.check_ws_connection()
-            if connection_status and getattr(self, "ws", None) is not None:
-                try:
-                    # 父類中已有的輔助方法，確保訂閲深度/行情/訂單更新流
-                    self._ensure_data_streams()  # type: ignore[attr-defined]
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("初始化數據流時出錯: %s", exc)
-
-            # 首次種子掛單：在買一/賣一掛出純 Maker 單
-            self.place_limit_orders()
-
-            # 事件驅動主循環：僅保持進程存活與適度打印統計，不做主動輪詢下單
-            report_interval = 300  # 每 5 分鐘打印一次簡要統計
-            last_report_time = start_time
-
-            while time.time() - start_time < duration_seconds and not getattr(self, "_stop_flag", False):
-                now_ts = time.time()
-
-                # 定期打印統計，但不干預交易邏輯
-                if now_ts - last_report_time >= report_interval:
-                    try:
-                        pnl_data = self.calculate_pnl()
-                        self.estimate_profit(pnl_data)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("打印統計時出錯: %s", exc)
-                    last_report_time = now_ts
-
-                # 輕量級 sleep，避免 CPU 忙等，不進行額外網絡請求
-                time.sleep(1)
-
-            logger.info("\n=== 純 Maker-Maker 策略運行結束 ===")
-            try:
-                self.print_trading_stats()
-            except Exception as exc:  # noqa: BLE001
-                logger.error("打印最終交易統計時出錯: %s", exc)
-
-        except KeyboardInterrupt:
-            logger.info("\n用戶中斷，停止純 Maker-Maker 策略")
-            try:
-                self.print_trading_stats()
-            except Exception as exc:  # noqa: BLE001
-                logger.error("打印中斷時交易統計時出錯: %s", exc)
-
-    # ------------------------------------------------------------------
-    # 节流与工具
-    # ------------------------------------------------------------------
-    def _respect_request_interval(self, slot: str) -> None:
-        interval = self._request_intervals.get(slot)
-        if not interval:
-            return
-        last_ts = self._last_request_ts.get(slot, 0.0)
-        now = time.monotonic()
-        wait_for = interval - (now - last_ts)
-        if wait_for > 0:
-            time.sleep(wait_for)
-        self._last_request_ts[slot] = time.monotonic()
-
-    def _submit_order(self, order: Dict[str, Any], slot: str) -> Any:
-        self._respect_request_interval(slot)
-        return self.client.execute_order(order)
-
-    def _build_limit_order(self, side: str, price: float, quantity: float) -> Dict[str, str]:
-        """依交易所特性构建限价订单负载。"""
-
-        order = {
-            "orderType": "Limit",
-            "price": str(round_to_tick_size(price, self.tick_size)),
-            "quantity": str(round_to_precision(quantity, self.base_precision)),
-            "side": side,
-            "symbol": self.symbol,
-            "timeInForce": "GTC",
-        }
-
-        if getattr(self, "exchange", "backpack") == "backpack":
-            order["postOnly"] = True
-            order["autoLendRedeem"] = True
-            order["autoLend"] = True
-
-        return order
+    def stop(self) -> None:
+        """停止策略"""
+        logger.info("收到停止信号")
+        self._stop_flag = True
+        super().stop()
 
 
-class _SpotPureMakerStrategy(_PureMakerMixin, MarketMaker):
-    """现货纯 Maker-Maker 策略实现。"""
-
-    def __init__(
-        self,
-        api_key: str,
-        secret_key: str,
-        symbol: str,
-        base_spread_percentage: float = 0.0,
-        order_quantity: Optional[float] = None,
-        exchange: str = "backpack",
-        exchange_config: Optional[Dict[str, Any]] = None,
-        close_price_mode: str = "entry",
-        next_round_delay_seconds: float = 3.0,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(
-            api_key=api_key,
-            secret_key=secret_key,
-            symbol=symbol,
-            base_spread_percentage=base_spread_percentage,
-            order_quantity=order_quantity,
-            exchange=exchange,
-            exchange_config=exchange_config,
-            strategy_label="现货纯Maker",
-            close_price_mode=close_price_mode,
-            next_round_delay_seconds=next_round_delay_seconds,
-            **kwargs,
-        )
-
-
-class _PerpPureMakerStrategy(_PureMakerMixin, PerpetualMarketMaker):
-    """永续合约纯 Maker-Maker 策略实现。"""
-
-    def __init__(
-        self,
-        api_key: str,
-        secret_key: str,
-        symbol: str,
-        base_spread_percentage: float = 0.0,
-        order_quantity: Optional[float] = None,
-        target_position: float = 0.0,
-        max_position: float = 1.0,
-        position_threshold: float = 0.1,
-        inventory_skew: float = 0.0,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        exchange: str = "backpack",
-        exchange_config: Optional[Dict[str, Any]] = None,
-        scale_in_price_step_pct: float = 0.0,
-        scale_in_size_pct: float = 0.0,
-        close_price_mode: str = "entry",
-        next_round_delay_seconds: float = 3.0,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(
-            api_key=api_key,
-            secret_key=secret_key,
-            symbol=symbol,
-            base_spread_percentage=base_spread_percentage,
-            order_quantity=order_quantity,
-            target_position=target_position,
-            max_position=max_position,
-            position_threshold=position_threshold,
-            inventory_skew=inventory_skew,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            exchange=exchange,
-            exchange_config=exchange_config,
-            strategy_label="永续纯Maker",
-            scale_in_price_step_pct=scale_in_price_step_pct,
-            scale_in_size_pct=scale_in_size_pct,
-            close_price_mode=close_price_mode,
-            next_round_delay_seconds=next_round_delay_seconds,
-            **kwargs,
-        )
-
-
-class PureMakerStrategy:
-    """根据市场类型返回对应的纯 Maker-Maker 策略实例。"""
-
-    def __new__(cls, *args: Any, market_type: str = "spot", **kwargs: Any):
-        market = (market_type or "spot").lower()
-        if market == "perp":
-            return _PerpPureMakerStrategy(*args, **kwargs)
-        return _SpotPureMakerStrategy(*args, **kwargs)
+# 工厂函数，保持兼容性
+def create_pure_maker_strategy(*args, **kwargs) -> PureMakerStrategy:
+    """创建纯 Maker-Maker 策略实例"""
+    return PureMakerStrategy(*args, **kwargs)
