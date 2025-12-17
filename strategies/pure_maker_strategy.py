@@ -61,6 +61,10 @@ class RoundState:
     scale_in_orders: List[TrackedOrder] = field(default_factory=list)  # 加仓订单列表
     position_direction: Optional[str] = None       # "LONG" 或 "SHORT"
     is_completed: bool = False
+    # 价格触发式加仓的状态
+    entry_price: float = 0.0                       # 入场价格（用于计算加仓触发价）
+    scale_in_count: int = 0                        # 已加仓次数
+    pending_scale_in: bool = False                 # 是否有加仓单正在挂单中
 
 
 class PureMakerStrategy(PerpetualMarketMaker):
@@ -541,91 +545,116 @@ class PureMakerStrategy(PerpetualMarketMaker):
             self._cancel_order_by_id(order_id)
 
     # ============================================================
-    # 加仓逻辑
+    # 价格触发式加仓逻辑
     # ============================================================
     
-    def _place_scale_in_orders(self, direction: str, entry_price: float, current_position: float) -> None:
-        """挂加仓订单梯队（优先使用批量下单）"""
+    def _check_scale_in_trigger(self) -> None:
+        """检查是否需要触发加仓"""
         if self.scale_in_price_step_pct <= 0 or self.scale_in_size_pct <= 0:
-            logger.debug("未配置加仓参数，跳过加仓单")
             return
-        
-        if current_position >= self.max_position - self.min_order_size / 2:
-            logger.info("当前仓位已达最大限制，无需加仓单")
-            return
-        
-        price_step_ratio = self.scale_in_price_step_pct / 100.0
-        size_ratio = self.scale_in_size_pct / 100.0
-        
-        remaining_capacity = self.max_position - current_position
-        current_size = current_position
-        level = 0
-        base_price = entry_price
-        
-        # 先计算所有加仓订单的参数
-        pending_orders = []
-        
-        while current_size < self.max_position - self.min_order_size / 2:
-            level += 1
-            
-            # 计算加仓价格
-            if direction == "LONG":
-                # 多头加仓：价格下跌时加仓
-                scale_price = base_price * (1.0 - price_step_ratio * level)
-                scale_side = "Bid"
-            else:
-                # 空头加仓：价格上涨时加仓
-                scale_price = base_price * (1.0 + price_step_ratio * level)
-                scale_side = "Ask"
-            
-            scale_price = round_to_tick_size(scale_price, self.tick_size)
-            if scale_price <= 0:
-                break
-            
-            # 计算加仓数量
-            add_qty = current_size * size_ratio
-            add_qty = min(add_qty, remaining_capacity)
-            add_qty = round_to_precision(add_qty, self.base_precision)
-            
-            if add_qty < self.min_order_size:
-                logger.debug("加仓数量 %s 低于最小单位，停止加仓", format_balance(add_qty))
-                break
-            
-            pending_orders.append({
-                "side": scale_side,
-                "price": scale_price,
-                "quantity": add_qty,
-                "role": OrderRole.SCALE_IN,
-                "level": level,
-            })
-            
-            current_size += add_qty
-            remaining_capacity -= add_qty
-            
-            # 防止无限循环
-            if level >= 20:
-                break
-        
-        if not pending_orders:
-            logger.info("无需挂加仓单")
-            return
-        
-        # 使用批量下单
-        logger.info("📈 准备挂 %d 个加仓单", len(pending_orders))
-        scale_in_orders = self._place_orders_batch(pending_orders, post_only=True, reduce_only=False)
-        
-        for order in scale_in_orders:
-            # 找到对应的 pending_order 获取 level
-            for po in pending_orders:
-                if abs(po["price"] - order.price) < self.tick_size / 2 and po["side"] == order.side:
-                    logger.info("📈 加仓单 #%d: 价格=%.8f, 数量=%s", po["level"], order.price, format_balance(order.quantity))
-                    break
         
         with self._state_lock:
-            self._round_state.scale_in_orders = scale_in_orders
+            # 检查前置条件
+            if self._round_state.is_completed:
+                return
+            if self._round_state.entry_price <= 0:
+                return
+            if self._round_state.pending_scale_in:
+                return  # 已有加仓单在挂单中，等待成交
+            
+            direction = self._round_state.position_direction
+            entry_price = self._round_state.entry_price
+            scale_in_count = self._round_state.scale_in_count
         
-        if scale_in_orders:
-            logger.info("✅ 已挂出 %d 个加仓单", len(scale_in_orders))
+        if not direction or direction == "FLAT":
+            return
+        
+        # 获取当前仓位
+        try:
+            position_state = self.get_position_state()
+            current_position = abs(float(position_state.get("net", 0.0) or 0.0))
+        except Exception:
+            return
+        
+        # 检查是否达到最大仓位
+        if current_position >= self.max_position - self.min_order_size / 2:
+            return
+        
+        # 获取当前市场价格
+        bid_price, ask_price = self.get_market_depth()
+        if bid_price is None or ask_price is None:
+            return
+        
+        # 计算下一次加仓的触发价格
+        price_step_ratio = self.scale_in_price_step_pct / 100.0
+        next_level = scale_in_count + 1
+        
+        if direction == "LONG":
+            # 多头：当前价格下跌到触发价时加仓
+            trigger_price = entry_price * (1.0 - price_step_ratio * next_level)
+            current_price = bid_price  # 用买一价判断
+            should_trigger = current_price <= trigger_price
+        else:
+            # 空头：当前价格上涨到触发价时加仓
+            trigger_price = entry_price * (1.0 + price_step_ratio * next_level)
+            current_price = ask_price  # 用卖一价判断
+            should_trigger = current_price >= trigger_price
+        
+        if should_trigger:
+            logger.info("📉 价格触发加仓！当前价格=%.4f, 触发价=%.4f, 加仓层级=%d",
+                        current_price, trigger_price, next_level)
+            self._execute_scale_in(direction, current_position, next_level)
+    
+    def _execute_scale_in(self, direction: str, current_position: float, level: int) -> None:
+        """执行单次加仓"""
+        # 计算加仓数量
+        size_ratio = self.scale_in_size_pct / 100.0
+        add_qty = current_position * size_ratio
+        remaining_capacity = self.max_position - current_position
+        add_qty = min(add_qty, remaining_capacity)
+        add_qty = round_to_precision(add_qty, self.base_precision)
+        
+        if add_qty < self.min_order_size:
+            logger.info("加仓数量 %s 低于最小单位，跳过", format_balance(add_qty))
+            return
+        
+        # 获取最新市场价格作为加仓价格（在买一/卖一挂单）
+        bid_price, ask_price = self.get_market_depth()
+        if bid_price is None or ask_price is None:
+            logger.warning("无法获取市场价格，跳过加仓")
+            return
+        
+        if direction == "LONG":
+            scale_side = "Bid"
+            scale_price = round_to_tick_size(bid_price, self.tick_size)
+        else:
+            scale_side = "Ask"
+            scale_price = round_to_tick_size(ask_price, self.tick_size)
+        
+        logger.info("📈 执行加仓 #%d: 方向=%s, 价格=%.8f, 数量=%s",
+                    level, scale_side, scale_price, format_balance(add_qty))
+        
+        # 标记正在加仓
+        with self._state_lock:
+            self._round_state.pending_scale_in = True
+        
+        # 下加仓单
+        order = self._place_post_only_order(
+            side=scale_side,
+            price=scale_price,
+            quantity=add_qty,
+            role=OrderRole.SCALE_IN,
+            reduce_only=False,
+        )
+        
+        if order:
+            with self._state_lock:
+                self._round_state.scale_in_orders.append(order)
+            logger.info("✅ 加仓单 #%d 已挂出: ID=%s", level, order.order_id)
+        else:
+            with self._state_lock:
+                self._round_state.pending_scale_in = False
+            logger.error("❌ 加仓单挂单失败")
 
     # ============================================================
     # 成交事件处理
@@ -754,9 +783,14 @@ class PureMakerStrategy(PerpetualMarketMaker):
             self._round_state.entry_order = order
             self._round_state.position_direction = direction
             
-            # 检查：是否已经处理过入场单成交（已有对冲单或加仓单）
+            # 记录入场价格（用于价格触发式加仓）
+            entry_price = avg_entry if avg_entry > 0 else order.price
+            if self._round_state.entry_price <= 0:  # 只在首次设置
+                self._round_state.entry_price = entry_price
+                logger.info("📌 记录入场价格: %.8f（用于价格触发式加仓）", entry_price)
+            
+            # 检查：是否已经处理过入场单成交（已有对冲单）
             already_has_hedge = self._round_state.hedge_order is not None
-            already_has_scale_in = len(self._round_state.scale_in_orders) > 0
         
         # 取消另一侧的入场单（这个可以重复执行，无副作用）
         if order.side == "Bid":
@@ -807,11 +841,8 @@ class PureMakerStrategy(PerpetualMarketMaker):
             else:
                 logger.error("❌ 对冲单挂单失败")
         
-        # 处理加仓单：只在首次成交时挂加仓单
-        if not already_has_scale_in:
-            self._place_scale_in_orders(direction, avg_entry if avg_entry > 0 else order.price, current_size)
-        else:
-            logger.info("🔄 [部分成交] 已有加仓单，跳过重复挂单")
+        # 价格触发式加仓：不立即挂单，而是等待价格触发
+        logger.info("📉 加仓策略: 等待价格下跌 %.2f%% 后触发加仓", self.scale_in_price_step_pct)
 
     def _on_scale_in_order_filled(
         self,
@@ -822,6 +853,14 @@ class PureMakerStrategy(PerpetualMarketMaker):
     ) -> None:
         """加仓单成交处理"""
         logger.info("📈 加仓单成交！当前仓位=%s", format_balance(net))
+        
+        # 更新加仓计数和状态
+        with self._state_lock:
+            self._round_state.scale_in_count += 1
+            self._round_state.pending_scale_in = False  # 清除正在加仓的标记
+            scale_in_count = self._round_state.scale_in_count
+        
+        logger.info("   └─ 累计加仓次数: %d", scale_in_count)
         
         # 更新对冲单价格为新的 breakEvenPrice
         if break_even_price > 0:
@@ -979,7 +1018,9 @@ class PureMakerStrategy(PerpetualMarketMaker):
     def _check_state_and_recover(self) -> None:
         """定时检查状态并恢复（容错机制）
         
-        当 WebSocket 漏推成交通知时，通过 API 查询实际状态来恢复
+        功能：
+        1. 当 WebSocket 漏推成交通知时，通过 API 查询实际状态来恢复
+        2. 检查价格是否触发加仓条件
         """
         # 如果下一轮已在调度中，跳过检查
         with self._next_round_lock:
@@ -1016,13 +1057,15 @@ class PureMakerStrategy(PerpetualMarketMaker):
                 self._schedule_next_round()
                 return
             
-            # 情况2: 有仓位 但 无挂单（对冲单/加仓单丢失）-> 需要补挂
+            # 情况2: 有仓位 但 无挂单（对冲单丢失）-> 需要补挂
             if abs(net) > tolerance and not has_open_orders:
                 logger.warning("⚠️ [定时检查] 有仓位(%.4f) 但无挂单，尝试补挂对冲单", net)
                 self._recover_hedge_order(net, direction, position_state)
                 return
             
-            # 其他情况正常，静默
+            # 情况3: 有仓位 且 有挂单 -> 检查是否需要触发加仓
+            if abs(net) > tolerance and has_open_orders:
+                self._check_scale_in_trigger()
             
         except Exception as e:
             logger.debug("定时状态检查异常: %s", e)
