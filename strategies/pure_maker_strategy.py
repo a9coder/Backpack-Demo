@@ -167,34 +167,48 @@ class PureMakerStrategy(PerpetualMarketMaker):
         logger.info("🚀 开始第 %d 轮交易", self._round_count)
         logger.info("=" * 50)
         
-        # 检查当前仓位，如果已有仓位且超过最大限制，跳过本轮
+        # 检查当前仓位和挂单状态
         try:
             position_state = self.get_position_state()
             current_net = float(position_state.get("net", 0.0) or 0.0)
             current_position = abs(current_net)
+            direction = position_state.get("direction", "FLAT")
             
+            # 查询当前挂单
+            open_orders = self.client.get_open_orders(self.symbol)
+            has_open_orders = False
+            if isinstance(open_orders, list):
+                has_open_orders = len(open_orders) > 0
+            elif isinstance(open_orders, dict) and "error" not in open_orders:
+                has_open_orders = True
+            
+            # 情况1: 仓位已达最大限制
             if current_position >= self.max_position - self.min_order_size / 2:
                 logger.warning("⚠️ 当前仓位 %.4f 已达最大限制 %.4f，等待平仓后再开始新轮", 
                             current_position, self.max_position)
-                # 尝试补挂对冲单
-                direction = position_state.get("direction", "FLAT")
-                if direction != "FLAT":
+                # 只有当没有挂单时才补挂对冲单
+                if not has_open_orders and direction != "FLAT":
                     self._recover_hedge_order(current_net, direction, position_state)
+                elif has_open_orders:
+                    logger.info("ℹ️ 已有挂单，等待平仓单成交...")
                 self._schedule_next_round()
                 return
             
-            # 如果当前有未平仓的仓位，先处理现有仓位
+            # 情况2: 有未平仓仓位
             if current_position > self.min_order_size:
-                logger.warning("⚠️ 检测到未平仓仓位: %.4f，尝试补挂对冲单", current_position)
-                direction = position_state.get("direction", "FLAT")
-                if direction != "FLAT":
+                logger.warning("⚠️ 检测到未平仓仓位: %.4f", current_position)
+                # 只有当没有挂单时才补挂对冲单
+                if not has_open_orders and direction != "FLAT":
+                    logger.info("📤 尝试补挂对冲单...")
                     self._recover_hedge_order(current_net, direction, position_state)
-                    # 设置 round_state 以便继续跟踪
-                    with self._state_lock:
-                        self._round_state.position_direction = direction
-                        avg_entry = float(position_state.get("avg_entry", 0.0) or 0.0)
-                        if avg_entry > 0:
-                            self._round_state.entry_price = avg_entry
+                elif has_open_orders:
+                    logger.info("ℹ️ 已有挂单，等待成交...")
+                # 设置 round_state 以便继续跟踪
+                with self._state_lock:
+                    self._round_state.position_direction = direction
+                    avg_entry = float(position_state.get("avg_entry", 0.0) or 0.0)
+                    if avg_entry > 0:
+                        self._round_state.entry_price = avg_entry
                 return
         except Exception as e:
             logger.warning("检查当前仓位时出错: %s", e)
