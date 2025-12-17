@@ -167,6 +167,38 @@ class PureMakerStrategy(PerpetualMarketMaker):
         logger.info("🚀 开始第 %d 轮交易", self._round_count)
         logger.info("=" * 50)
         
+        # 检查当前仓位，如果已有仓位且超过最大限制，跳过本轮
+        try:
+            position_state = self.get_position_state()
+            current_net = float(position_state.get("net", 0.0) or 0.0)
+            current_position = abs(current_net)
+            
+            if current_position >= self.max_position - self.min_order_size / 2:
+                logger.warning("⚠️ 当前仓位 %.4f 已达最大限制 %.4f，等待平仓后再开始新轮", 
+                            current_position, self.max_position)
+                # 尝试补挂对冲单
+                direction = position_state.get("direction", "FLAT")
+                if direction != "FLAT":
+                    self._recover_hedge_order(current_net, direction, position_state)
+                self._schedule_next_round()
+                return
+            
+            # 如果当前有未平仓的仓位，先处理现有仓位
+            if current_position > self.min_order_size:
+                logger.warning("⚠️ 检测到未平仓仓位: %.4f，尝试补挂对冲单", current_position)
+                direction = position_state.get("direction", "FLAT")
+                if direction != "FLAT":
+                    self._recover_hedge_order(current_net, direction, position_state)
+                    # 设置 round_state 以便继续跟踪
+                    with self._state_lock:
+                        self._round_state.position_direction = direction
+                        avg_entry = float(position_state.get("avg_entry", 0.0) or 0.0)
+                        if avg_entry > 0:
+                            self._round_state.entry_price = avg_entry
+                return
+        except Exception as e:
+            logger.warning("检查当前仓位时出错: %s", e)
+        
         # 获取买一/卖一价格
         bid_price, ask_price = self.get_market_depth()
         if bid_price is None or ask_price is None:
@@ -177,7 +209,7 @@ class PureMakerStrategy(PerpetualMarketMaker):
         logger.info("📊 当前盘口: 买一 %.8f | 卖一 %.8f | 价差 %.4f%%", 
                     bid_price, ask_price, (ask_price - bid_price) / bid_price * 100)
         
-        # 计算订单数量
+        # 计算订单数量，确保不超过剩余容量
         qty = self._calculate_order_quantity(bid_price)
         if qty is None or qty < self.min_order_size:
             logger.error("❌ 订单数量计算失败或过小，跳过本轮")
@@ -607,16 +639,38 @@ class PureMakerStrategy(PerpetualMarketMaker):
     
     def _execute_scale_in(self, direction: str, current_position: float, level: int) -> None:
         """执行单次加仓"""
+        # 再次检查当前仓位，确保不超过最大限制
+        try:
+            position_state = self.get_position_state()
+            actual_position = abs(float(position_state.get("net", 0.0) or 0.0))
+        except Exception:
+            actual_position = current_position
+        
+        # 检查是否已达最大仓位
+        if actual_position >= self.max_position - self.min_order_size / 2:
+            logger.info("⚠️ 当前仓位 %.4f 已达最大限制 %.4f，跳过加仓", 
+                        actual_position, self.max_position)
+            return
+        
         # 计算加仓数量
         size_ratio = self.scale_in_size_pct / 100.0
-        add_qty = current_position * size_ratio
-        remaining_capacity = self.max_position - current_position
+        add_qty = actual_position * size_ratio
+        remaining_capacity = self.max_position - actual_position
         add_qty = min(add_qty, remaining_capacity)
         add_qty = round_to_precision(add_qty, self.base_precision)
         
         if add_qty < self.min_order_size:
             logger.info("加仓数量 %s 低于最小单位，跳过", format_balance(add_qty))
             return
+        
+        # 再次确认加仓后不会超过最大仓位
+        if actual_position + add_qty > self.max_position + self.min_order_size / 2:
+            add_qty = self.max_position - actual_position
+            add_qty = round_to_precision(add_qty, self.base_precision)
+            if add_qty < self.min_order_size:
+                logger.info("调整后加仓数量仍低于最小单位，跳过")
+                return
+            logger.info("📌 调整加仓数量以不超过最大仓位: %s", format_balance(add_qty))
         
         # 获取最新市场价格作为加仓价格（在买一/卖一挂单）
         bid_price, ask_price = self.get_market_depth()
@@ -631,8 +685,9 @@ class PureMakerStrategy(PerpetualMarketMaker):
             scale_side = "Ask"
             scale_price = round_to_tick_size(ask_price, self.tick_size)
         
-        logger.info("📈 执行加仓 #%d: 方向=%s, 价格=%.8f, 数量=%s",
-                    level, scale_side, scale_price, format_balance(add_qty))
+        logger.info("📈 执行加仓 #%d: 方向=%s, 价格=%.8f, 数量=%s (加仓后仓位=%.4f/%.4f)",
+                    level, scale_side, scale_price, format_balance(add_qty),
+                    actual_position + add_qty, self.max_position)
         
         # 标记正在加仓
         with self._state_lock:
