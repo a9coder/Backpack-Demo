@@ -707,23 +707,43 @@ class PureMakerStrategy(PerpetualMarketMaker):
         with self._state_lock:
             self._round_state.pending_scale_in = True
         
-        # 下加仓单
-        order = self._place_post_only_order(
+        # 下加仓单（不使用 Post-Only，允许立即成交）
+        with self._order_lock:
+            result = self.open_position(
+                side=scale_side,
+                quantity=add_qty,
+                price=scale_price,
+                order_type="Limit",
+                reduce_only=False,
+                post_only=False,
+            )
+        
+        if isinstance(result, dict) and "error" in result:
+            logger.error("❌ 加仓单失败: %s", result.get("error"))
+            with self._state_lock:
+                self._round_state.pending_scale_in = False
+            return
+        
+        order_id = result.get("id")
+        if not order_id:
+            logger.error("❌ 加仓单成功但未返回订单ID")
+            with self._state_lock:
+                self._round_state.pending_scale_in = False
+            return
+        
+        tracked = TrackedOrder(
+            order_id=str(order_id),
+            role=OrderRole.SCALE_IN,
             side=scale_side,
             price=scale_price,
             quantity=add_qty,
-            role=OrderRole.SCALE_IN,
-            reduce_only=False,
         )
         
-        if order:
-            with self._state_lock:
-                self._round_state.scale_in_orders.append(order)
-            logger.info("✅ 加仓单 #%d 已挂出: ID=%s", level, order.order_id)
-        else:
-            with self._state_lock:
-                self._round_state.pending_scale_in = False
-            logger.error("❌ 加仓单挂单失败")
+        with self._state_lock:
+            self._tracked_orders[tracked.order_id] = tracked
+            self._round_state.scale_in_orders.append(tracked)
+        
+        logger.info("✅ 加仓单 #%d 已提交: ID=%s (非 Post-Only，可立即成交)", level, order_id)
 
     # ============================================================
     # 成交事件处理
